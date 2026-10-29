@@ -5,8 +5,8 @@ mod ui;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
@@ -81,6 +81,44 @@ pub struct Loading {
     select: Option<Vec<u8>>,
 }
 
+/// What a running apply is doing, updated by the apply thread.
+#[derive(Default)]
+pub struct ApplyProgress {
+    pub total: usize,
+    pub total_bytes: u64,
+    /// Items finished so far and their size.
+    pub done: usize,
+    pub done_bytes: u64,
+    pub deleted: usize,
+    pub kept: usize,
+    /// The item being worked on and what is happening to it.
+    pub current: Option<(PathBuf, u64, &'static str)>,
+    pub started: Option<Instant>,
+}
+
+impl ApplyProgress {
+    fn on(&mut self, event: apply::Event<'_>) {
+        match event {
+            apply::Event::Checking(_, item) => {
+                self.current = Some((item.path.clone(), item.alloc, "checking"))
+            }
+            apply::Event::Deleting(_, item) => {
+                self.current = Some((item.path.clone(), item.alloc, "moving to trash"))
+            }
+            apply::Event::Finished(item, outcome) => {
+                self.current = None;
+                self.done += 1;
+                self.done_bytes += item.alloc;
+                match outcome {
+                    Outcome::Deleted => self.deleted += 1,
+                    Outcome::Kept(_) => self.kept += 1,
+                    Outcome::Gone => {}
+                }
+            }
+        }
+    }
+}
+
 /// Facts about a directory that need a walk, cached per node.
 pub struct Details {
     pub largest: Vec<NodeId>,
@@ -115,7 +153,8 @@ pub struct App {
     /// Why items were kept by the last apply.
     pub notes: HashMap<PathBuf, String>,
     applying: Option<Receiver<ApplyResult>>,
-    pub busy: Option<&'static str>,
+    /// Live progress of a running apply.
+    pub apply_progress: Option<Arc<Mutex<ApplyProgress>>>,
     message: Option<(String, Instant)>,
     details: HashMap<NodeId, Details>,
     pub home: Option<PathBuf>,
@@ -222,7 +261,7 @@ impl App {
             pending: Vec::new(),
             notes: HashMap::new(),
             applying: None,
-            busy: None,
+            apply_progress: None,
             message: None,
             details: HashMap::new(),
             home: hogs_core::user::home(),
@@ -265,7 +304,7 @@ impl App {
             && let Ok(result) = rx.try_recv()
         {
             self.applying = None;
-            self.busy = None;
+            self.apply_progress = None;
             self.finish_apply(result);
         }
         if self.last_staged_check.elapsed() > Duration::from_secs(1) {
@@ -655,17 +694,27 @@ impl App {
             self.say("Nothing was deleted: the confirmed items are no longer staged.");
             return;
         }
+        let progress = Arc::new(Mutex::new(ApplyProgress {
+            total: items.len(),
+            total_bytes: items.iter().map(|i| i.alloc).sum(),
+            started: Some(Instant::now()),
+            ..Default::default()
+        }));
         let store_path = self.store.path().to_path_buf();
         let (tx, rx) = mpsc::channel();
+        let shared = progress.clone();
         std::thread::spawn(move || {
             let store = StagingStore::at(store_path);
-            let result = apply::apply_items(&store, &items, false)
-                .map(|outcomes| items.into_iter().zip(outcomes).collect())
-                .map_err(|e| e.to_string());
+            let snapshots = SnapshotStore::open_default().ok();
+            let result = apply::apply_items(&store, snapshots.as_ref(), &items, false, |e| {
+                shared.lock().unwrap().on(e)
+            })
+            .map(|outcomes| items.into_iter().zip(outcomes).collect())
+            .map_err(|e| e.to_string());
             let _ = tx.send(result);
         });
         self.applying = Some(rx);
-        self.busy = Some("Checking and moving items to the trash…");
+        self.apply_progress = Some(progress);
     }
 
     fn finish_apply(&mut self, result: ApplyResult) {
@@ -875,6 +924,43 @@ mod tests {
             "other row: {:?}",
             bar_fg(3)
         );
+    }
+
+    #[test]
+    fn apply_progress_dialog() {
+        let data = tempfile::tempdir().unwrap();
+        let mut app = App::blank(StagingStore::at(data.path().join("staged.json")));
+        app.home = Some("/home/u".into());
+        let mut p = ApplyProgress {
+            total: 12,
+            total_bytes: 10 << 30,
+            started: Some(Instant::now()),
+            ..Default::default()
+        };
+        let item = |path: &str, alloc| StagedItem {
+            path: path.into(),
+            alloc,
+            newest_mtime: 0,
+            reason: String::new(),
+            staged_by: String::new(),
+            staged_at: 0,
+        };
+        for _ in 0..2 {
+            let done = item("/home/u/old", 2 << 30);
+            p.on(apply::Event::Finished(&done, &Outcome::Deleted));
+        }
+        let current = item("/home/u/projects/app/node_modules", 1 << 30);
+        p.on(apply::Event::Deleting(2, &current));
+        app.apply_progress = Some(Arc::new(Mutex::new(p)));
+        let s = screen(&mut app);
+        println!("{s}");
+        assert!(s.contains("item 3 of 12"), "{s}");
+        assert!(s.contains("4.0 GiB of 10.0 GiB"), "{s}");
+        assert!(
+            s.contains("moving to trash ~/projects/app/node_modules (1.0 GiB)"),
+            "{s}"
+        );
+        assert!(s.contains("2 deleted · 0 kept"), "{s}");
     }
 
     /// Prints the browser on a folder, for README screenshots. The largest

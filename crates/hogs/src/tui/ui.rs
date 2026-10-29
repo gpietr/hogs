@@ -9,7 +9,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, Cell, Clear, Gauge, Paragraph, Row, Table, Wrap};
 
 use super::{App, Popup, View};
 use crate::report::{age, count};
@@ -49,10 +49,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Some(Popup::ConfirmApply) => draw_confirm(f, app),
         None => {}
     }
-    if let Some(busy) = app.busy {
-        let area = centered(f.area(), 50, 3);
-        f.render_widget(Clear, area);
-        f.render_widget(Paragraph::new(busy).block(Block::bordered()), area);
+    if let Some(progress) = &app.apply_progress {
+        draw_apply_progress(f, &progress.lock().unwrap(), app.home.as_deref());
     }
 }
 
@@ -582,6 +580,63 @@ fn draw_help(f: &mut Frame) {
     f.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(" help ")),
         area,
+    );
+}
+
+fn draw_apply_progress(f: &mut Frame, p: &super::ApplyProgress, home: Option<&Path>) {
+    let area = centered(f.area(), 72, 8);
+    f.render_widget(Clear, area);
+    let block = Block::bordered().title(" applying ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let [heading, gauge, _, current, stats] =
+        Layout::vertical([Constraint::Length(1); 5]).areas(inner);
+    let n = (p.done + 1).min(p.total);
+    f.render_widget(
+        Line::from(format!("Moving to the trash: item {n} of {}", p.total)).bold(),
+        heading,
+    );
+    let ratio = if p.total_bytes == 0 {
+        p.done as f64 / p.total.max(1) as f64
+    } else {
+        p.done_bytes as f64 / p.total_bytes as f64
+    };
+    f.render_widget(
+        Gauge::default()
+            .ratio(ratio.clamp(0.0, 1.0))
+            .label(format!(
+                "{} of {}",
+                human_size(p.done_bytes),
+                human_size(p.total_bytes)
+            ))
+            .gauge_style(Style::new().fg(BAR))
+            .use_unicode(glyphs().eighths),
+        gauge,
+    );
+    if let Some((path, size, doing)) = &p.current {
+        let tail = format!(" ({})", human_size(*size));
+        let room = (current.width as usize).saturating_sub(doing.len() + 1 + tail.len());
+        let mut shown = tilde(path, home);
+        let len = shown.chars().count();
+        if len > room {
+            shown = format!(
+                "…{}",
+                shown
+                    .chars()
+                    .skip(len + 1 - room.max(1))
+                    .collect::<String>()
+            );
+        }
+        f.render_widget(Line::from(format!("{doing} {shown}{tail}")), current);
+    }
+    let secs = p.started.map_or(0.0, |s| s.elapsed().as_secs_f64());
+    f.render_widget(
+        Line::from(format!(
+            "{} deleted · {} kept · {secs:.0}s",
+            p.deleted, p.kept
+        ))
+        .dim(),
+        stats,
     );
 }
 

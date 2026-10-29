@@ -4,7 +4,7 @@
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{Instant, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
 use hogs_core::fmt::human_size;
@@ -152,32 +152,50 @@ pub enum Outcome {
     Kept(String),
 }
 
-/// Verifies and deletes `items`, drops the finished ones from the staged
-/// list and invalidates cached scans that contained them. Shared by
+/// Progress of an apply, reported as it goes.
+pub enum Event<'a> {
+    /// Re-checking item `n` (rescans directories, which can take a while).
+    Checking(usize, &'a StagedItem),
+    /// Item `n` passed the checks and is being deleted.
+    Deleting(usize, &'a StagedItem),
+    /// The item is done.
+    Finished(&'a StagedItem, &'a Outcome),
+}
+
+/// Verifies and deletes `items` one by one, removing each finished one from
+/// the staged list right away (so an interrupted apply leaves an accurate
+/// list), then invalidates cached scans that contained them. Shared by
 /// `hogs staged apply` and the TUI, so both apply exactly the same checks.
 pub fn apply_items(
     store: &StagingStore,
+    snapshots: Option<&SnapshotStore>,
     items: &[StagedItem],
     permanent: bool,
+    mut report: impl FnMut(Event<'_>),
 ) -> Result<Vec<Outcome>> {
-    let outcomes: Vec<Outcome> = items
-        .iter()
-        .map(
-            |item| match verify(item).and_then(|()| delete(&item.path, permanent)) {
-                Ok(()) => Outcome::Deleted,
-                Err(e) if e == "no longer exists" => Outcome::Gone,
-                Err(e) => Outcome::Kept(e),
-            },
-        )
-        .collect();
-    let done: Vec<PathBuf> = items
-        .iter()
-        .zip(&outcomes)
-        .filter(|(_, o)| !matches!(o, Outcome::Kept(_)))
-        .map(|(i, _)| i.path.clone())
-        .collect();
-    store.update(|all| all.retain(|i| !done.contains(&i.path)))?;
-    if let Ok(snapshots) = SnapshotStore::open_default() {
+    let mut outcomes = Vec::with_capacity(items.len());
+    let mut done = Vec::new();
+    for (n, item) in items.iter().enumerate() {
+        report(Event::Checking(n, item));
+        let outcome = match verify(item) {
+            Ok(()) => {
+                report(Event::Deleting(n, item));
+                match delete(&item.path, permanent) {
+                    Ok(()) => Outcome::Deleted,
+                    Err(e) => Outcome::Kept(e),
+                }
+            }
+            Err(e) if e == "no longer exists" => Outcome::Gone,
+            Err(e) => Outcome::Kept(e),
+        };
+        if !matches!(outcome, Outcome::Kept(_)) {
+            store.update(|all| all.retain(|i| i.path != item.path))?;
+            done.push(item.path.clone());
+        }
+        report(Event::Finished(item, &outcome));
+        outcomes.push(outcome);
+    }
+    if let Some(snapshots) = snapshots {
         snapshots.invalidate(&done);
     }
     Ok(outcomes)
@@ -201,6 +219,104 @@ pub fn list_text(items: &[StagedItem]) -> String {
         human_size(total)
     ));
     out
+}
+
+/// Terminal output for `hogs staged apply`: a status line rewritten in place
+/// while an item is checked and deleted, and one result line per item.
+struct StatusLine {
+    live: bool,
+    total: usize,
+    total_bytes: u64,
+    done_bytes: u64,
+    started: Instant,
+    deleting: &'static str,
+}
+
+impl StatusLine {
+    fn new(items: &[StagedItem], permanent: bool) -> Self {
+        StatusLine {
+            live: io::stdout().is_terminal(),
+            total: items.len(),
+            total_bytes: items.iter().map(|i| i.alloc).sum(),
+            done_bytes: 0,
+            started: Instant::now(),
+            deleting: if permanent {
+                "deleting"
+            } else {
+                "moving to trash"
+            },
+        }
+    }
+
+    fn on(&mut self, event: Event<'_>) {
+        match event {
+            Event::Checking(n, item) => self.status(n, "checking", item),
+            Event::Deleting(n, item) => self.status(n, self.deleting, item),
+            Event::Finished(item, outcome) => {
+                self.clear_status();
+                match outcome {
+                    Outcome::Deleted => println!("  deleted  {}", item.path.display()),
+                    Outcome::Gone => {
+                        println!("  gone     {} (already removed)", item.path.display())
+                    }
+                    Outcome::Kept(e) => println!("  KEPT     {}: {e}", item.path.display()),
+                }
+                self.done_bytes += item.alloc;
+            }
+        }
+    }
+
+    fn status(&self, n: usize, doing: &str, item: &StagedItem) {
+        if !self.live {
+            return;
+        }
+        let head = format!(
+            "[{}/{}] {} of {} · {doing} ",
+            n + 1,
+            self.total,
+            human_size(self.done_bytes),
+            human_size(self.total_bytes)
+        );
+        let tail = format!(
+            " ({}) · {:.0}s",
+            human_size(item.alloc),
+            self.started.elapsed().as_secs_f64()
+        );
+        // One line only: a wrapped line could not be rewritten in place.
+        // Some terminals (and ptys) report no size; assume 80 columns then.
+        let width = ratatui::crossterm::terminal::size()
+            .ok()
+            .filter(|&(w, _)| w >= 20)
+            .map_or(80, |(w, _)| w as usize)
+            .saturating_sub(1);
+        let room = width.saturating_sub(head.chars().count() + tail.chars().count());
+        let path = fit(&item.path.display().to_string(), room);
+        self.clear_status();
+        print!("{head}{path}{tail}");
+        let _ = io::stdout().flush();
+    }
+
+    fn clear_status(&self) {
+        if self.live {
+            let _ = ratatui::crossterm::execute!(
+                io::stdout(),
+                ratatui::crossterm::cursor::MoveToColumn(0),
+                ratatui::crossterm::terminal::Clear(
+                    ratatui::crossterm::terminal::ClearType::CurrentLine
+                )
+            );
+        }
+    }
+}
+
+/// `s` shortened to `width` characters by cutting its start: the end of a path says the most.
+fn fit(s: &str, width: usize) -> String {
+    let len = s.chars().count();
+    if len <= width {
+        return s.to_string();
+    }
+    let keep = width.saturating_sub(1);
+    format!("…{}", s.chars().skip(len - keep).collect::<String>())
 }
 
 fn confirm(prompt: &str, expected: &str) -> io::Result<bool> {
@@ -249,18 +365,18 @@ pub fn apply(store: &StagingStore, permanent: bool) -> Result<()> {
         return Ok(());
     }
 
-    let outcomes = apply_items(store, &items, permanent)?;
-    let mut freed = 0;
-    for (item, outcome) in items.iter().zip(&outcomes) {
-        match outcome {
-            Outcome::Deleted => {
-                println!("  deleted  {}", item.path.display());
-                freed += item.alloc;
-            }
-            Outcome::Gone => println!("  gone     {} (already removed)", item.path.display()),
-            Outcome::Kept(e) => println!("  KEPT     {}: {e}", item.path.display()),
-        }
-    }
+    let mut progress = StatusLine::new(&items, permanent);
+    let snapshots = SnapshotStore::open_default().ok();
+    let outcomes = apply_items(store, snapshots.as_ref(), &items, permanent, |e| {
+        progress.on(e)
+    })?;
+    let freed: u64 = items
+        .iter()
+        .zip(&outcomes)
+        .filter(|(_, o)| matches!(o, Outcome::Deleted))
+        .map(|(i, _)| i.alloc)
+        .sum();
+    println!("Done in {:.1}s.", progress.started.elapsed().as_secs_f64());
     if permanent {
         println!("Freed {}.", human_size(freed));
     } else {
@@ -324,6 +440,73 @@ mod tests {
                 .unwrap_err()
                 .contains("modified since")
         );
+    }
+
+    #[test]
+    fn apply_reports_progress_and_updates_the_list_per_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        fs::create_dir_all(root.join("old/deep")).unwrap();
+        fs::write(root.join("old/deep/f"), b"x").unwrap();
+        fs::write(root.join("changed"), b"x").unwrap();
+        let items = [
+            item(root.join("old"), i64::MAX),
+            item(root.join("gone"), i64::MAX),
+            item(root.join("changed"), 0),
+        ];
+        let data = tempfile::tempdir().unwrap();
+        let store = StagingStore::at(data.path().join("staged.json"));
+        store
+            .update(|all| all.extend(items.iter().cloned()))
+            .unwrap();
+
+        let mut events = Vec::new();
+        let outcomes = apply_items(&store, None, &items, true, |e| {
+            let staged = store.load().unwrap().len();
+            events.push(match e {
+                Event::Checking(n, _) => format!("check {n} ({staged} staged)"),
+                Event::Deleting(n, _) => format!("delete {n}"),
+                Event::Finished(i, Outcome::Deleted) => {
+                    format!("deleted {}", i.path.file_name().unwrap().display())
+                }
+                Event::Finished(i, Outcome::Gone) => {
+                    format!("gone {}", i.path.file_name().unwrap().display())
+                }
+                Event::Finished(i, Outcome::Kept(_)) => {
+                    format!("kept {}", i.path.file_name().unwrap().display())
+                }
+            });
+        })
+        .unwrap();
+        assert_eq!(
+            events,
+            [
+                "check 0 (3 staged)",
+                "delete 0",
+                "deleted old",
+                // The list shrinks as items finish, not only at the end.
+                "check 1 (2 staged)",
+                "gone gone",
+                "check 2 (1 staged)",
+                "kept changed",
+            ]
+        );
+        assert!(matches!(
+            outcomes[..],
+            [Outcome::Deleted, Outcome::Gone, Outcome::Kept(_)]
+        ));
+        assert!(!root.join("old").exists() && root.join("changed").exists());
+        assert_eq!(store.load().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn status_paths_keep_their_end() {
+        assert_eq!(
+            fit("/home/u/projects/app/node_modules", 18),
+            "…/app/node_modules"
+        );
+        assert_eq!(fit("short", 10), "short");
+        assert_eq!(fit("zażółć", 4), "…ółć");
     }
 
     #[cfg(target_os = "linux")]
