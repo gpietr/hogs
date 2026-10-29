@@ -13,7 +13,7 @@ unchanged. Your agent works out what each item is and whether deleting it is a g
 delete anything:** agents can stage items with a reason, and you review and apply them.
 
 ```
- hogs   ~/projects/old-dashboard  106.1 MiB on disk · 5 files · scanned 1s ago · sort: size
+ hogs   ~/projects/old-dashboard  106.1 MiB on disk · 5 files · scanned 0s ago · sort: size
 ┌ old-dashboard ─────────────────────────────────────────────────────────┐┌ details ───────────────────────────────────────┐
 │✗ 106.0 MiB ██████████ 100.0%     2y node_modules/                      ││node_modules                                    │
 │   16.0 KiB              0.0%     2y src/                               ││~/projects/old-dashboard/node_modules           │
@@ -32,7 +32,7 @@ delete anything:** agents can stage items with a reason, and you review and appl
 │                                                                        ││ 31.0 MiB     2y  @babel/core/lib/index.js      │
 │                                                                        ││ 23.0 MiB     2y  typescript/lib/typescript.js  │
 └ 1/3 ───────────────────────────────────────────────────────────────────┘└────────────────────────────────────────────────┘
- ↑↓ move · → open · ← back · s stage · Tab staged (1, 106.0 MiB) · a apply · / filter · o sort · ? help · q quit
+ ↑↓ move · → open · ← back · s stage · Tab staged (1, 106.0 MiB) · a apply · c compare · / filter · o sort · ? help · q quit
 ```
 
 ## Why hogs
@@ -81,7 +81,7 @@ Run `hogs` (or `hogs tui PATH`) in a terminal.
 | `→` / `Enter`, `←` / `Backspace` | open a folder, go up |
 | `s` / `Space` | stage or unstage the selected item |
 | `Tab` | the staged list: who staged each item and why. `Space` leaves an item out, `u` unstages it |
-| `a` | apply: re-check the staged items and move them to the trash, after you confirm |
+| `a` | apply: re-check the staged items and move them to the trash after you confirm, with live progress |
 | `c` | compare with an earlier scan: a change column and a "largest growth first" sort |
 | `/`, `o`, `r`, `?`, `q` | filter by name, change the sort (size, oldest change, files, name), rescan, help, quit |
 
@@ -121,7 +121,7 @@ change anywhere inside, and the path.
 | `hogs diff [PATH] [--since 1d] [--files]` | what grew or shrank since an earlier scan, largest change first |
 | `hogs history [PATH]` | past scans and how sizes changed; `--clear` deletes the history |
 | `hogs stage PATH... --reason TEXT` | stage paths for deletion (paths can also come from stdin). Deletes nothing |
-| `hogs staged [list\|apply\|remove\|clear]` | review the staged list, or apply it: to the trash, or `--permanent` |
+| `hogs staged [list\|apply\|remove\|clear]` | review the staged list, or apply it (to the trash, or `--permanent`) with live progress |
 | `hogs scan [PATH]` | rescan and print a summary; `--backend auto\|generic\|mft` picks the scanner |
 
 Global options: `--paths` / `-0` (print only paths), `--rescan`, `--max-age 10m`.
@@ -155,7 +155,8 @@ $ hogs diff ~/projects --files -n 3
   thinned out over time: the last 3 scans, one per day for a month, and one per week for half a year.
 - **How much space it takes.** History entries keep every folder with its exact size, but only files of
   1 MiB or more, so a scan of a 500k-file home folder takes about 0.7 MB. Smaller files are never listed
-  individually, but their changes still show in their folders' totals.
+  individually, but their changes still show in their folders' totals. That is also why `[new]` can
+  mean "under 1 MiB in the earlier scan".
 
 ## Working with coding agents
 

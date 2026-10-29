@@ -819,7 +819,7 @@ impl App {
                 shared.lock().unwrap().on(e)
             })
             .map(|outcomes| items.into_iter().zip(outcomes).collect())
-            .map_err(|e| e.to_string());
+            .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
         });
         self.applying = Some(rx);
@@ -831,6 +831,9 @@ impl App {
             Ok(r) => r,
             Err(e) => {
                 self.say(format!("Apply failed: {e}"));
+                // Some items may have been deleted: show the disk as it is now.
+                self.reload_staged();
+                self.rescan();
                 return;
             }
         };

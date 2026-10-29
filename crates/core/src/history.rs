@@ -22,6 +22,8 @@ pub const MIN_FILE: u64 = 1 << 20;
 const MAGIC: &[u8; 8] = b"HOGSHIST";
 const VERSION: u32 = 1;
 const KEEP_LATEST: usize = 3;
+/// Upper bound on an entry's decompressed size.
+const MAX_RAW: u64 = 1 << 30;
 const DAY: i64 = 86_400;
 const DAILY_FOR: i64 = 31 * DAY;
 const WEEKLY_FOR: i64 = 183 * DAY;
@@ -64,28 +66,24 @@ impl History {
         let root = tree.root_path();
         let name = format!("{:016x}-{}.hist", path_hash(root), tree.scanned_at());
         let target = self.dir.join(name);
-        let tmp = target.with_extension(format!("tmp{}", std::process::id()));
-        let mut out = io::BufWriter::new(File::create(&tmp)?);
         let root_bytes = root.as_os_str().as_encoded_bytes();
-        out.write_all(MAGIC)?;
-        out.write_all(&VERSION.to_le_bytes())?;
-        out.write_all(&tree.scanned_at().to_le_bytes())?;
-        for n in [
-            tree.alloc(Tree::ROOT),
-            tree.size(Tree::ROOT),
-            u64::from(tree.files(Tree::ROOT)),
-        ] {
-            out.write_all(&n.to_le_bytes())?;
-        }
-        out.write_all(&(root_bytes.len() as u32).to_le_bytes())?;
-        out.write_all(root_bytes)?;
-        let mut body = DeflateEncoder::new(out, Compression::fast());
-        snapshot::write(&pruned, &mut body)?;
-        body.finish()?
-            .into_inner()
-            .map_err(|e| e.into_error())?
-            .sync_all()?;
-        fs::rename(&tmp, &target)?;
+        snapshot::write_atomic(&target, |out| {
+            out.write_all(MAGIC)?;
+            out.write_all(&VERSION.to_le_bytes())?;
+            out.write_all(&tree.scanned_at().to_le_bytes())?;
+            for n in [
+                tree.alloc(Tree::ROOT),
+                tree.size(Tree::ROOT),
+                u64::from(tree.files(Tree::ROOT)),
+            ] {
+                out.write_all(&n.to_le_bytes())?;
+            }
+            out.write_all(&(root_bytes.len() as u32).to_le_bytes())?;
+            out.write_all(root_bytes)?;
+            let mut body = DeflateEncoder::new(out, Compression::fast());
+            snapshot::write(&pruned, &mut body)?;
+            body.finish().map(drop)
+        })?;
         crate::user::give_back(&target);
         self.thin(root, crate::staging::now());
         Ok(())
@@ -128,8 +126,15 @@ impl History {
     pub fn load(&self, entry: &Entry) -> io::Result<Tree> {
         let data = fs::read(&entry.file)?;
         let (_, body) = read_header(&data).ok_or_else(|| invalid("bad header"))?;
+        // Bounded: a corrupt or crafted entry must not exhaust memory (root reads
+        // the invoking user's cache under sudo). Real entries are far smaller.
         let mut raw = Vec::new();
-        DeflateDecoder::new(&data[body..]).read_to_end(&mut raw)?;
+        DeflateDecoder::new(&data[body..])
+            .take(MAX_RAW)
+            .read_to_end(&mut raw)?;
+        if raw.len() as u64 == MAX_RAW {
+            return Err(invalid("too large"));
+        }
         snapshot::read(&raw)
     }
 

@@ -132,6 +132,25 @@ pub fn read(data: &[u8]) -> io::Result<Tree> {
     Ok(tree)
 }
 
+/// Writes `target` through a temporary file renamed into place. The temporary
+/// file is removed if anything fails, so a full disk leaves nothing behind.
+pub(crate) fn write_atomic(
+    target: &Path,
+    write: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>,
+) -> io::Result<()> {
+    let tmp = target.with_extension(format!("tmp{}", std::process::id()));
+    let result = (|| {
+        let mut w = BufWriter::new(File::create(&tmp)?);
+        write(&mut w)?;
+        w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+        fs::rename(&tmp, target)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// FNV-1a of a path: stable across Rust versions, unlike `DefaultHasher`.
 pub(crate) fn path_hash(path: &Path) -> u64 {
     path.as_os_str()
@@ -167,11 +186,7 @@ impl SnapshotStore {
     /// Saves a tree, dropping snapshots of directories inside it (now redundant).
     pub fn save(&self, tree: &Tree) -> io::Result<()> {
         let target = self.file_for(tree.root_path());
-        let tmp = target.with_extension(format!("tmp{}", std::process::id()));
-        let mut w = BufWriter::new(File::create(&tmp)?);
-        write(tree, &mut w)?;
-        w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
-        fs::rename(&tmp, &target)?;
+        write_atomic(&target, |w| write(tree, w))?;
         crate::user::give_back(&target);
         for (file, h) in self.headers() {
             if file != target && h.root.starts_with(tree.root_path()) {
@@ -330,6 +345,25 @@ mod tests {
             .is_err()
         );
         assert!(write_bad(|_| ()).is_ok());
+    }
+
+    #[test]
+    fn failed_writes_leave_no_temporary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("x.snap");
+        let err = write_atomic(&target, |w| {
+            w.write_all(b"partial")?;
+            Err(io::Error::other("disk full"))
+        });
+        assert!(err.is_err());
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "temporary file left behind"
+        );
+        write_atomic(&target, |w| w.write_all(b"ok")).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"ok");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

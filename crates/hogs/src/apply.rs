@@ -175,6 +175,7 @@ pub fn apply_items(
 ) -> Result<Vec<Outcome>> {
     let mut outcomes = Vec::with_capacity(items.len());
     let mut done = Vec::new();
+    let mut list_error = None;
     for (n, item) in items.iter().enumerate() {
         report(Event::Checking(n, item));
         let outcome = match verify(item) {
@@ -189,7 +190,11 @@ pub fn apply_items(
             Err(e) => Outcome::Kept(e),
         };
         if !matches!(outcome, Outcome::Kept(_)) {
-            store.update(|all| all.retain(|i| i.path != item.path))?;
+            // Keep going if the list cannot be written: every item is re-checked
+            // anyway, and stopping half-way would leave even more stale.
+            if let Err(e) = store.update(|all| all.retain(|i| i.path != item.path)) {
+                list_error.get_or_insert(e);
+            }
             done.push(item.path.clone());
         }
         report(Event::Finished(item, &outcome));
@@ -198,7 +203,11 @@ pub fn apply_items(
     if let Some(snapshots) = snapshots {
         snapshots.invalidate(&done);
     }
-    Ok(outcomes)
+    match list_error {
+        Some(e) => Err(anyhow::Error::from(e)
+            .context("items were applied, but the staged list could not be updated")),
+        None => Ok(outcomes),
+    }
 }
 
 pub fn list_text(items: &[StagedItem]) -> String {

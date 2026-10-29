@@ -26,6 +26,8 @@ Workflow (for people and coding agents):
   2. hogs dirs PATH, hogs files PATH, hogs ext PATH, hogs find PATH --name ... --older 180d
                                drill down; look inside anything unfamiliar before judging it
      hogs diff PATH [--since 1d]   what grew (or shrank) since an earlier scan; hogs keeps a history
+                               (files under 1 MiB are only counted in their folders, so [new] may
+                               also mean 'under 1 MiB before')
   3. hogs stage PATH... --reason TEXT
                                stage items the user agreed to (paths can also come from stdin:
                                hogs find ~ --name node_modules --type d --older 180d --paths | hogs stage --reason ...)
