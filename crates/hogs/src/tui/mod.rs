@@ -783,7 +783,7 @@ mod tests {
         println!("{s}\n");
         assert!(
             s.lines()
-                .any(|l| l.contains('✗') && l.contains("node_modules/")),
+                .any(|l| l.contains(ui::glyphs().staged) && l.contains("node_modules/")),
             "{s}"
         );
         assert!(s.contains("staged by claude-code"), "{s}");

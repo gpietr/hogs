@@ -86,6 +86,10 @@ Run `hogs` (or `hogs tui PATH`) in a terminal.
 
 Items staged by an agent show up live, marked `✗`, with the agent's reason. Folders containing staged items get `•`.
 
+On Windows, use **Windows Terminal** for the best display. The classic console window can't draw some
+characters, so there hogs uses simpler ones: `×` instead of `✗`, and coarser bars. Set
+`HOGS_GLYPHS=basic` or `HOGS_GLYPHS=unicode` to override the automatic choice.
+
 ### Commands
 
 ```

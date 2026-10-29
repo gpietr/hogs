@@ -80,13 +80,49 @@ pub fn date(ts: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-/// A size bar with eighth-block resolution.
-fn bar(fraction: f64, width: usize) -> String {
+/// Characters the terminal can draw.
+pub struct Glyphs {
+    /// Eighth blocks for fine-grained bars; otherwise full and half blocks only.
+    pub eighths: bool,
+    pub staged: &'static str,
+}
+
+const UNICODE: Glyphs = Glyphs {
+    eighths: true,
+    staged: "✗",
+};
+/// The classic Windows console's fonts (Consolas, Lucida Console) lack the
+/// eighth blocks and ✗, which show as `?`; they do have █, ▌, × and •.
+const BASIC: Glyphs = Glyphs {
+    eighths: false,
+    staged: "×",
+};
+
+pub fn glyphs() -> &'static Glyphs {
+    static GLYPHS: std::sync::OnceLock<&'static Glyphs> = std::sync::OnceLock::new();
+    GLYPHS.get_or_init(|| pick_glyphs(cfg!(windows), |v| std::env::var(v).ok()))
+}
+
+/// `HOGS_GLYPHS=basic|unicode` overrides; on Windows only terminals known to
+/// draw Unicode well (Windows Terminal, VS Code and others setting TERM_PROGRAM)
+/// get the full set.
+fn pick_glyphs(windows: bool, env: impl Fn(&str) -> Option<String>) -> &'static Glyphs {
+    match env("HOGS_GLYPHS").as_deref() {
+        Some("basic") => &BASIC,
+        Some("unicode") => &UNICODE,
+        _ if !windows || env("WT_SESSION").is_some() || env("TERM_PROGRAM").is_some() => &UNICODE,
+        _ => &BASIC,
+    }
+}
+
+/// A size bar: eighth-block resolution where the terminal can draw it, half blocks otherwise.
+fn bar(fraction: f64, width: usize, eighths: bool) -> String {
     const PARTS: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
-    let eighths = (fraction.clamp(0.0, 1.0) * (width * 8) as f64).round() as usize;
-    let mut s: String = "█".repeat(eighths / 8);
-    if !eighths.is_multiple_of(8) {
-        s.push(PARTS[eighths % 8]);
+    let steps = if eighths { 8 } else { 2 };
+    let units = (fraction.clamp(0.0, 1.0) * (width * steps) as f64).round() as usize;
+    let mut s: String = "█".repeat(units / steps);
+    if !units.is_multiple_of(steps) {
+        s.push(PARTS[units % steps * 8 / steps]);
     }
     format!("{s:<width$}")
 }
@@ -167,7 +203,7 @@ fn draw_list(f: &mut Frame, area: Rect, app: &mut App) {
             let selected = start + i == app.selected;
             let path = tree.path(id);
             let (mark, mark_style) = if app.staged_cover(&path).is_some() {
-                ("✗", Style::new().fg(STAGED).bold())
+                (glyphs().staged, Style::new().fg(STAGED).bold())
             } else if app.staged_inside(&path).next().is_some() {
                 ("•", Style::new().fg(CONTAINS))
             } else {
@@ -190,7 +226,7 @@ fn draw_list(f: &mut Frame, area: Rect, app: &mut App) {
                 Cell::from(mark).style(mark_style),
                 Cell::from(format!("{:>9}", human_size(tree.alloc(id)))),
                 // Reverse video would turn a coloured bar into a solid block on the selected row.
-                Cell::from(bar(fraction, 10)).style(if selected {
+                Cell::from(bar(fraction, 10, glyphs().eighths)).style(if selected {
                     Style::new()
                 } else {
                     Style::new().fg(BAR)
@@ -308,7 +344,7 @@ fn draw_details(f: &mut Frame, area: Rect, app: &mut App) {
                 format!("staged as part of {}", tilde(&item.path, home.as_deref()))
             };
             lines.push(
-                Line::from(format!("✗ {what} by {}", item.staged_by))
+                Line::from(format!("{} {what} by {}", glyphs().staged, item.staged_by))
                     .fg(STAGED)
                     .bold(),
             );
@@ -531,7 +567,11 @@ fn draw_help(f: &mut Frame) {
         .collect();
     lines.push(Line::default());
     lines.push(
-        Line::from("Marks: ✗ staged (or inside a staged folder), • contains staged items.").dim(),
+        Line::from(format!(
+            "Marks: {} staged (or inside a staged folder), • contains staged items.",
+            glyphs().staged
+        ))
+        .dim(),
     );
     lines.push(Line::from("Ages show the newest change anywhere inside a folder.").dim());
     lines.push(
@@ -601,10 +641,47 @@ mod tests {
 
     #[test]
     fn bars() {
-        assert_eq!(bar(0.0, 4), "    ");
-        assert_eq!(bar(1.0, 4), "████");
-        assert_eq!(bar(0.5, 4), "██  ");
-        assert_eq!(bar(0.125, 4), "▌   ");
+        assert_eq!(bar(0.0, 4, true), "    ");
+        assert_eq!(bar(1.0, 4, true), "████");
+        assert_eq!(bar(0.5, 4, true), "██  ");
+        assert_eq!(bar(0.125, 4, true), "▌   ");
+        assert_eq!(bar(0.03, 4, true), "▏   ");
+        // Without eighth blocks: halves only.
+        assert_eq!(bar(1.0, 4, false), "████");
+        assert_eq!(bar(0.625, 4, false), "██▌ ");
+        assert_eq!(bar(0.03, 4, false), "    ");
+        assert!(
+            bar(0.99, 4, false)
+                .chars()
+                .all(|c| matches!(c, '█' | '▌' | ' '))
+        );
+    }
+
+    #[test]
+    fn glyphs_per_terminal() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                vars.iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert!(
+            pick_glyphs(false, env(&[])).eighths,
+            "Linux and macOS terminals"
+        );
+        assert!(
+            !pick_glyphs(true, env(&[])).eighths,
+            "classic Windows console"
+        );
+        assert!(
+            pick_glyphs(true, env(&[("WT_SESSION", "x")])).eighths,
+            "Windows Terminal"
+        );
+        assert!(pick_glyphs(true, env(&[("TERM_PROGRAM", "vscode")])).eighths);
+        assert!(!pick_glyphs(false, env(&[("HOGS_GLYPHS", "basic")])).eighths);
+        assert!(pick_glyphs(true, env(&[("HOGS_GLYPHS", "unicode")])).eighths);
+        assert_eq!(pick_glyphs(true, env(&[])).staged, "×");
     }
 
     #[test]
