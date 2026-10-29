@@ -1073,7 +1073,8 @@ mod tests {
         assert_eq!(names, ["logs", "new", "static"], "largest growth first");
         let s = screen(&mut app);
         println!("{s}");
-        assert!(s.contains("comparing with"), "{s}");
+        // Visible even when the path fills the header.
+        assert!(s.lines().next().unwrap().contains("comparing with"), "{s}");
         assert!(
             s.lines()
                 .any(|l| l.contains("+10.0 MiB") && l.contains("logs/")),

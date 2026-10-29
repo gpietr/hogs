@@ -114,6 +114,17 @@ fn bar(fraction: f64, width: usize, eighths: bool) -> String {
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![Span::styled(" hogs ", Style::new().bold().reversed())];
     if let Some(tree) = &app.tree {
+        // Modes first: a long path must not push them off the screen.
+        if let Some(b) = &app.baseline {
+            let ago = ago(hogs_core::staging::now() - b.scanned_at);
+            spans.push(Span::styled(
+                format!(" comparing with {ago} "),
+                Style::new().fg(CONTAINS).reversed(),
+            ));
+        }
+        if app.loading.is_some() {
+            spans.push(Span::styled("  rescanning…", Style::new().fg(CONTAINS)));
+        }
         let dir = app.dir;
         spans.push(Span::raw(format!(
             "  {}  {} on disk · {} files · scanned {} ago · sort: {}",
@@ -123,18 +134,6 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             short_age(hogs_core::staging::now() - tree.scanned_at()),
             app.sort.label(),
         )));
-        if let Some(b) = &app.baseline {
-            spans.push(Span::styled(
-                format!(
-                    "  comparing with {}",
-                    ago(hogs_core::staging::now() - b.scanned_at)
-                ),
-                Style::new().fg(CONTAINS),
-            ));
-        }
-        if app.loading.is_some() {
-            spans.push(Span::styled("  rescanning…", Style::new().fg(CONTAINS)));
-        }
     }
     f.render_widget(Line::from(spans), area);
 }
