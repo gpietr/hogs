@@ -6,13 +6,15 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use hogs_core::Tree;
+use hogs_core::diff;
 use hogs_core::fmt::human_size;
+use hogs_core::history::MIN_FILE;
 use hogs_core::protect::is_protected;
 use hogs_core::query::{self, Filter};
 use hogs_core::staging::{self, StageOutcome, StagedItem, StagingStore};
+use hogs_core::{NodeId, Tree};
 
-use crate::report::{Output, Rows};
+use crate::report::{Output, Rows, ago, count, datetime, signed};
 use crate::session::{Session, canonical};
 
 pub struct Ctx {
@@ -118,6 +120,318 @@ pub fn find(ctx: &mut Ctx, path: &Path, filter: &Filter, limit: usize) -> Result
         );
     }
     emit(&out)
+}
+
+/// Past scans: grouped by root, or the size of `path` in every scan covering it.
+pub fn history(ctx: &mut Ctx, path: Option<&Path>, clear: bool) -> Result<()> {
+    let history = ctx
+        .session
+        .history
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("the scan history is unavailable"))?;
+    if clear {
+        let n = history.clear()?;
+        return emit(&format!(
+            "Deleted {}.\n",
+            count(n, "saved scan", "saved scans")
+        ));
+    }
+    let now = staging::now();
+    let mut out = String::new();
+    let row = |out: &mut String, at: i64, size: u64, older: Option<u64>, note: &str| {
+        let change = older.map_or(String::new(), |o| signed(size as i64 - o as i64));
+        let _ = writeln!(
+            out,
+            "  {}  {:>9}  {:>10}  {:>11}{note}",
+            datetime(at),
+            ago(now - at),
+            human_size(size),
+            change
+        );
+    };
+    match path {
+        None => {
+            let entries = history.entries();
+            if entries.is_empty() {
+                return emit(&format!("No saved scans yet. {HISTORY_NOTE}"));
+            }
+            let bytes: u64 = entries.iter().map(|e| e.bytes).sum();
+            let _ = writeln!(
+                out,
+                "{} using {}.",
+                count(entries.len(), "saved scan", "saved scans"),
+                human_size(bytes)
+            );
+            let mut roots: Vec<&Path> = Vec::new();
+            for e in &entries {
+                if !roots.contains(&e.root.as_path()) {
+                    roots.push(&e.root);
+                }
+            }
+            for root in roots {
+                let _ = writeln!(out, "\n{}", root.display());
+                let series: Vec<_> = entries.iter().filter(|e| e.root == root).collect();
+                for (i, e) in series.iter().enumerate() {
+                    row(
+                        &mut out,
+                        e.scanned_at,
+                        e.alloc,
+                        series.get(i + 1).map(|o| o.alloc),
+                        "",
+                    );
+                }
+            }
+        }
+        Some(p) => {
+            let p = canonical(p)?;
+            let entries = history.covering(&p);
+            if entries.is_empty() {
+                return emit(&format!("No saved scans yet. {HISTORY_NOTE}"));
+            }
+            let _ = writeln!(
+                out,
+                "{} in {}:",
+                p.display(),
+                count(entries.len(), "saved scan", "saved scans")
+            );
+            let sizes: Vec<Option<u64>> = entries
+                .iter()
+                .map(|e| {
+                    history
+                        .load(e)
+                        .ok()
+                        .and_then(|t| t.lookup(&p).map(|id| t.alloc(id)))
+                })
+                .collect();
+            for (i, (e, size)) in entries.iter().zip(&sizes).enumerate() {
+                let note = if e.root == p {
+                    String::new()
+                } else {
+                    format!("  (scan of {})", e.root.display())
+                };
+                match size {
+                    Some(size) => row(
+                        &mut out,
+                        e.scanned_at,
+                        *size,
+                        sizes.get(i + 1).copied().flatten(),
+                        &note,
+                    ),
+                    None => {
+                        let _ = writeln!(
+                            out,
+                            "  {}  {:>9}  {:>10}{note}",
+                            datetime(e.scanned_at),
+                            ago(now - e.scanned_at),
+                            "absent"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    emit(&out)
+}
+
+const HISTORY_NOTE: &str = "hogs keeps a history of its scans (at most one per 10 minutes, thinned out \
+over time), so check again after it has scanned for a while, e.g. tomorrow.\n";
+
+pub struct DiffOptions {
+    pub since: Option<i64>,
+    pub depth: usize,
+    pub limit: usize,
+    pub files: bool,
+}
+
+/// What changed below `path` since an earlier scan, largest change first.
+pub fn diff(ctx: &mut Ctx, path: &Path, opts: &DiffOptions) -> Result<()> {
+    let (tree, id) = ctx.session.resolve(path)?;
+    let history = ctx
+        .session
+        .history
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("the scan history is unavailable"))?;
+    let target = tree.path(id);
+    let now = staging::now();
+    // The newest earlier scan: before this one, or at least `since` old.
+    let cutoff = opts.since.map_or(tree.scanned_at() - 1, |s| now - s);
+    let Some(entry) = history
+        .covering(&target)
+        .into_iter()
+        .find(|e| e.scanned_at <= cutoff)
+    else {
+        let msg = match opts.since {
+            Some(_) => format!(
+                "No saved scan of {} that old yet; see `hogs history`.\n",
+                target.display()
+            ),
+            None => format!(
+                "No earlier scan of {} yet. {HISTORY_NOTE}",
+                target.display()
+            ),
+        };
+        return emit(&msg);
+    };
+    let old = history.load(&entry)?;
+    let old_id = old.lookup(&target);
+    let before = old_id.map_or(0, |o| old.alloc(o));
+    let total = tree.alloc(id) as i64 - before as i64;
+    let mut out = String::new();
+    let table = ctx.output == Output::Table;
+    if table {
+        let _ = writeln!(
+            out,
+            "{}: {} now, {} since {} ({}){}",
+            target.display(),
+            human_size(tree.alloc(id)),
+            signed(total),
+            datetime(entry.scanned_at),
+            ago(now - entry.scanned_at),
+            if old_id.is_none() {
+                ", when it did not exist"
+            } else {
+                ""
+            },
+        );
+    }
+    // Ignore changes too small to matter relative to the total.
+    let threshold = MIN_FILE.max(total.unsigned_abs() / 100);
+    let d = Differ {
+        new: &tree,
+        old: &old,
+        threshold,
+        limit: opts.limit,
+        output: ctx.output,
+    };
+    let shown = if opts.files {
+        d.files(&mut out, id, old_id)
+    } else {
+        d.tree(&mut out, Some(id), old_id, opts.depth.max(1), 0)
+    };
+    if shown == 0 && table {
+        let _ = writeln!(out, "No changes of {} or more.", human_size(threshold));
+    }
+    emit(&out)
+}
+
+struct Differ<'a> {
+    new: &'a Tree,
+    old: &'a Tree,
+    threshold: u64,
+    limit: usize,
+    output: Output,
+}
+
+impl Differ<'_> {
+    fn path(&self, c: &diff::Change) -> PathBuf {
+        match (c.new, c.old) {
+            (Some(n), _) => self.new.path(n),
+            (None, Some(o)) => self.old.path(o),
+            (None, None) => PathBuf::new(),
+        }
+    }
+
+    fn line(&self, out: &mut String, c: &diff::Change, indent: usize, is_dir: bool) {
+        let path = self.path(c);
+        if let Output::Paths { nul } = self.output {
+            let _ = write!(out, "{}", path.display());
+            out.push(if nul { '\0' } else { '\n' });
+            return;
+        }
+        let tag = match (c.new, c.old) {
+            (_, None) => "  [new]",
+            (None, _) => "  [gone]",
+            _ => "",
+        };
+        let slash = if is_dir { "/" } else { "" };
+        let _ = writeln!(
+            out,
+            "{:indent$}{:>11} {:>10}  {}{slash}{tag}",
+            "",
+            signed(c.delta()),
+            human_size(c.now),
+            path.display()
+        );
+    }
+
+    /// Changed entries as a tree; returns how many were shown. In path mode
+    /// only the innermost shown entries are printed.
+    fn tree(
+        &self,
+        out: &mut String,
+        n: Option<NodeId>,
+        o: Option<NodeId>,
+        depth: usize,
+        indent: usize,
+    ) -> usize {
+        let changes = diff::children(self.new, n, self.old, o);
+        let big: Vec<_> = changes
+            .iter()
+            .filter(|c| c.delta().unsigned_abs() >= self.threshold)
+            .collect();
+        for c in big.iter().take(self.limit) {
+            let is_dir = c.is_dir(self.new, self.old);
+            let mut inner = String::new();
+            let below = if depth > 1 && is_dir {
+                self.tree(&mut inner, c.new, c.old, depth - 1, indent + 2)
+            } else {
+                0
+            };
+            if self.output == Output::Table || below == 0 {
+                self.line(out, c, indent, is_dir);
+            }
+            out.push_str(&inner);
+        }
+        if big.len() > self.limit && self.output == Output::Table {
+            let _ = writeln!(
+                out,
+                "{:indent$}… {} more changes",
+                "",
+                big.len() - self.limit
+            );
+        }
+        big.len().min(self.limit)
+    }
+
+    /// The files that changed most, at any depth.
+    fn files(&self, out: &mut String, n: NodeId, o: Option<NodeId>) -> usize {
+        let (new, old) = (self.new, self.old);
+        let mut changes = Vec::new();
+        new.walk(n, |c, _| {
+            if !new.is_dir(c) && new.alloc(c) >= MIN_FILE {
+                let before = old.lookup(&new.path(c));
+                changes.push(diff::Change {
+                    new: Some(c),
+                    old: before,
+                    now: new.alloc(c),
+                    before: before.map_or(0, |b| old.alloc(b)),
+                });
+            }
+            true
+        });
+        if let Some(o) = o {
+            old.walk(o, |c, _| {
+                if !old.is_dir(c) && new.lookup(&old.path(c)).is_none() {
+                    changes.push(diff::Change {
+                        new: None,
+                        old: Some(c),
+                        now: 0,
+                        before: old.alloc(c),
+                    });
+                }
+                true
+            });
+        }
+        changes.retain(|c| c.delta().unsigned_abs() >= self.threshold);
+        changes.sort_by_key(|c| std::cmp::Reverse(c.delta().unsigned_abs()));
+        for c in changes.iter().take(self.limit) {
+            self.line(out, c, 0, false);
+        }
+        if changes.len() > self.limit && self.output == Output::Table {
+            let _ = writeln!(out, "… {} more changed files", changes.len() - self.limit);
+        }
+        changes.len().min(self.limit)
+    }
 }
 
 /// Paths from the arguments, or from stdin when none are given (or `-`).

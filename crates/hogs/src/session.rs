@@ -7,6 +7,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
+use hogs_core::history::History;
 use hogs_core::snapshot::SnapshotStore;
 use hogs_core::staging;
 use hogs_core::{NodeId, Progress, Tree};
@@ -14,6 +15,7 @@ use hogs_scan::ScanOptions;
 
 pub struct Session {
     store: Option<SnapshotStore>,
+    pub history: Option<History>,
     max_age: i64,
     rescan: bool,
     opts: ScanOptions,
@@ -27,17 +29,22 @@ impl Session {
         let store = SnapshotStore::open_default()
             .map_err(|e| eprintln!("hogs: scan cache unavailable: {e}"))
             .ok();
-        Session::with_store(store, max_age, rescan, opts)
+        let history = History::open_default()
+            .map_err(|e| eprintln!("hogs: scan history unavailable: {e}"))
+            .ok();
+        Session::with_store(store, history, max_age, rescan, opts)
     }
 
     pub fn with_store(
         store: Option<SnapshotStore>,
+        history: Option<History>,
         max_age: i64,
         rescan: bool,
         opts: ScanOptions,
     ) -> Self {
         Session {
             store,
+            history,
             max_age,
             rescan,
             opts,
@@ -60,6 +67,11 @@ impl Session {
             && let Err(e) = store.save(&tree)
         {
             eprintln!("hogs: could not save the scan: {e}");
+        }
+        if let Some(history) = &self.history
+            && let Err(e) = history.record(&tree)
+        {
+            eprintln!("hogs: could not add the scan to the history: {e}");
         }
         let tree = Rc::new(tree);
         self.trees
@@ -143,6 +155,7 @@ mod tests {
     fn session(cache: &Path) -> Session {
         Session::with_store(
             Some(SnapshotStore::at(cache.into())),
+            None,
             600,
             false,
             ScanOptions::default(),

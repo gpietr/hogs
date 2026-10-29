@@ -17,6 +17,52 @@ pub fn age(mtime: i64, now: i64) -> String {
     }
 }
 
+/// `YYYY-MM-DD` for a Unix timestamp (UTC).
+pub fn date(ts: i64) -> String {
+    // Howard Hinnant's civil_from_days.
+    let z = ts.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// `YYYY-MM-DD HH:MM UTC` for a Unix timestamp.
+pub fn datetime(ts: i64) -> String {
+    let secs = ts.rem_euclid(86_400);
+    format!(
+        "{} {:02}:{:02} UTC",
+        date(ts),
+        secs / 3600,
+        secs % 3600 / 60
+    )
+}
+
+/// How long ago, coarsely: `just now`, `5m ago`, `16h ago`, `3d ago`.
+pub fn ago(secs: i64) -> String {
+    match secs.max(0) {
+        ..60 => "just now".into(),
+        s @ 60..3600 => format!("{}m ago", s / 60),
+        s @ 3600..172_800 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86_400),
+    }
+}
+
+/// A size change with its sign, e.g. `+1.2 GiB`, `-50.0 MiB`.
+pub fn signed(delta: i64) -> String {
+    let sign = match delta.signum() {
+        1 => "+",
+        -1 => "-",
+        _ => "",
+    };
+    format!("{sign}{}", human_size(delta.unsigned_abs()))
+}
+
 /// `1 item`, `2 items`.
 pub fn count(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
@@ -194,6 +240,22 @@ mod tests {
         assert!(parse_duration("90").is_err());
         assert!(parse_duration("-5d").is_err());
         assert!(parse_size("-1G").is_err());
+    }
+
+    #[test]
+    fn dates() {
+        assert_eq!(date(0), "1970-01-01");
+        assert_eq!(date(951_782_400), "2000-02-29");
+        assert_eq!(date(1_793_261_106), "2026-10-29");
+        assert_eq!(date(-86_400), "1969-12-31");
+        assert_eq!(datetime(1_793_261_106), "2026-10-29 08:05 UTC");
+        assert_eq!(ago(30), "just now");
+        assert_eq!(ago(5 * 60), "5m ago");
+        assert_eq!(ago(16 * 3600), "16h ago");
+        assert_eq!(ago(3 * 86_400), "3d ago");
+        assert_eq!(signed(3 << 30), "+3.0 GiB");
+        assert_eq!(signed(-(50 << 20)), "-50.0 MiB");
+        assert_eq!(signed(0), "0 B");
     }
 
     #[test]

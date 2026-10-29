@@ -11,12 +11,13 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Cell, Clear, Gauge, Paragraph, Row, Table, Wrap};
 
-use super::{App, Popup, View};
-use crate::report::{age, count};
+use super::{App, Delta, Popup, View};
+use crate::report::{age, ago, count, date, signed};
 
 const STAGED: Color = Color::Red;
 const CONTAINS: Color = Color::Yellow;
 const BAR: Color = Color::Cyan;
+const SHRANK: Color = Color::Green;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let [header, body, footer] = Layout::vertical([
@@ -61,21 +62,6 @@ pub fn tilde(path: &Path, home: Option<&Path>) -> String {
         Some(rest) => format!("~/{}", rest.display()),
         None => path.display().to_string(),
     }
-}
-
-/// `YYYY-MM-DD` for a Unix timestamp (UTC).
-pub fn date(ts: i64) -> String {
-    // Howard Hinnant's civil_from_days.
-    let z = ts.div_euclid(86_400) + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!("{year:04}-{month:02}-{day:02}")
 }
 
 /// Characters the terminal can draw.
@@ -137,6 +123,15 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             short_age(hogs_core::staging::now() - tree.scanned_at()),
             app.sort.label(),
         )));
+        if let Some(b) = &app.baseline {
+            spans.push(Span::styled(
+                format!(
+                    "  comparing with {}",
+                    ago(hogs_core::staging::now() - b.scanned_at)
+                ),
+                Style::new().fg(CONTAINS),
+            ));
+        }
         if app.loading.is_some() {
             spans.push(Span::styled("  rescanning…", Style::new().fg(CONTAINS)));
         }
@@ -194,6 +189,7 @@ fn draw_list(f: &mut Frame, area: Rect, app: &mut App) {
     let start = scroll(&mut app.offset, app.selected, height);
     let total = tree.alloc(app.dir).max(1);
     let now = hogs_core::staging::now();
+    let comparing = app.baseline.is_some();
     let rows: Vec<Row> = app.entries[start..(start + height).min(app.entries.len())]
         .iter()
         .enumerate()
@@ -220,7 +216,17 @@ fn draw_list(f: &mut Frame, area: Rect, app: &mut App) {
             if tree.flags(id) & (flags::ERROR | flags::OTHER_FS) != 0 {
                 name.push_str(" !");
             }
-            let row = Row::new(vec![
+            let change = match app.delta(id) {
+                Some(Delta::New) => {
+                    Cell::from(format!("{:>10}", "new")).style(Style::new().fg(CONTAINS))
+                }
+                Some(Delta::Changed { delta, .. }) if delta != 0 => {
+                    let color = if delta > 0 { CONTAINS } else { SHRANK };
+                    Cell::from(format!("{:>10}", signed(delta))).style(Style::new().fg(color))
+                }
+                _ => Cell::from(""),
+            };
+            let mut cells = vec![
                 Cell::from(mark).style(mark_style),
                 Cell::from(format!("{:>9}", human_size(tree.alloc(id)))),
                 // Reverse video would turn a coloured bar into a solid block on the selected row.
@@ -230,9 +236,18 @@ fn draw_list(f: &mut Frame, area: Rect, app: &mut App) {
                     Style::new().fg(BAR)
                 }),
                 Cell::from(format!("{:>5.1}%", fraction * 100.0)),
-                Cell::from(format!("{:>6}", age(tree.mtime(id), now))),
-                Cell::from(name).style(name_style),
-            ]);
+            ];
+            if comparing {
+                // Like the bar, a coloured cell would invert into a block on the selected row.
+                cells.push(if selected {
+                    change.style(Style::new())
+                } else {
+                    change
+                });
+            }
+            cells.push(Cell::from(format!("{:>6}", age(tree.mtime(id), now))));
+            cells.push(Cell::from(name).style(name_style));
+            let row = Row::new(cells);
             if selected {
                 row.style(Style::new().reversed())
             } else {
@@ -256,14 +271,16 @@ fn draw_list(f: &mut Frame, area: Rect, app: &mut App) {
         (app.selected + 1).min(app.entries.len()),
         app.entries.len()
     ));
-    let widths = [
+    let mut widths = vec![
         Constraint::Length(1),
         Constraint::Length(9),
         Constraint::Length(10),
         Constraint::Length(6),
-        Constraint::Length(6),
-        Constraint::Fill(1),
     ];
+    if comparing {
+        widths.push(Constraint::Length(10));
+    }
+    widths.extend([Constraint::Length(6), Constraint::Fill(1)]);
     let mut table = Table::new(rows, widths).block(block);
     if app.entries.is_empty() {
         table = table.header(Row::new(vec!["", "", "", "", "", "(empty)"]));
@@ -314,6 +331,19 @@ fn draw_details(f: &mut Frame, area: Rect, app: &mut App) {
             "today" => "today".to_string(),
             a => format!("{a} ago"),
         };
+        if let Some(b) = &app.baseline {
+            let when = date(b.scanned_at);
+            match app.delta(id) {
+                Some(Delta::Changed { before, delta }) => {
+                    lines.push(kv(
+                        "before",
+                        format!("{} on {when} ({})", human_size(before), signed(delta)),
+                    ));
+                }
+                Some(Delta::New) => lines.push(kv("before", format!("did not exist on {when}"))),
+                None => {}
+            }
+        }
         let label = if tree.is_dir(id) {
             "newest change"
         } else {
@@ -521,7 +551,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         let keys = match app.view {
             View::Browse => {
                 format!(
-                    " ↑↓ move · → open · ← back · s stage · {staged} · a apply · / filter · o sort · ? help · q quit"
+                    " ↑↓ move · → open · ← back · s stage · {staged} · a apply · c compare · / filter · o sort · ? help · q quit"
                 )
             }
             View::Staged => " ↑↓ move · Space include · u unstage · Enter show · a apply · Tab browse · ? help · q quit".to_string(),
@@ -548,7 +578,14 @@ fn draw_help(f: &mut Frame) {
         ("← Backspace h", "go up"),
         ("s Space", "stage / unstage the selected item"),
         ("/", "filter by name (Esc clears)"),
-        ("o", "change sort: size, oldest change, file count, name"),
+        (
+            "o",
+            "change sort: size, oldest change, file count, name (and growth)",
+        ),
+        (
+            "c",
+            "compare with an earlier scan: change column, growth sort",
+        ),
         ("Tab", "switch between browser and staged list"),
         ("a", "apply: move the selected staged items to the trash"),
         ("r", "rescan"),
@@ -685,14 +722,6 @@ fn draw_confirm(f: &mut Frame, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn dates() {
-        assert_eq!(date(0), "1970-01-01");
-        assert_eq!(date(951_782_400), "2000-02-29");
-        assert_eq!(date(1_793_261_106), "2026-10-29");
-        assert_eq!(date(-86_400), "1969-12-31");
-    }
 
     #[test]
     fn bars() {

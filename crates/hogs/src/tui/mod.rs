@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
+use hogs_core::diff;
 use hogs_core::fmt::human_size;
+use hogs_core::history::History;
 use hogs_core::protect::is_protected;
 use hogs_core::query::{self, ExtStat};
 use hogs_core::snapshot::SnapshotStore;
@@ -20,7 +22,7 @@ use hogs_scan::ScanOptions;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::apply::{self, Outcome};
-use crate::report::count;
+use crate::report::{self, count};
 use crate::session::canonical;
 
 /// Reuse saved scans younger than this when starting.
@@ -33,15 +35,18 @@ pub enum Sort {
     Oldest,
     Files,
     Name,
+    /// Largest growth since the comparison scan first (only while comparing).
+    Growth,
 }
 
 impl Sort {
-    fn next(self) -> Self {
+    fn next(self, comparing: bool) -> Self {
         match self {
             Sort::Size => Sort::Oldest,
             Sort::Oldest => Sort::Files,
             Sort::Files => Sort::Name,
-            Sort::Name => Sort::Size,
+            Sort::Name if comparing => Sort::Growth,
+            Sort::Name | Sort::Growth => Sort::Size,
         }
     }
 
@@ -51,6 +56,7 @@ impl Sort {
             Sort::Oldest => "oldest change first",
             Sort::Files => "file count",
             Sort::Name => "name",
+            Sort::Growth => "growth",
         }
     }
 }
@@ -79,6 +85,19 @@ pub struct Loading {
     /// Where to go once loaded: a directory, and optionally an entry in it to select.
     target: PathBuf,
     select: Option<Vec<u8>>,
+}
+
+/// An earlier scan from the history, for comparing.
+pub struct Baseline {
+    pub tree: Tree,
+    pub scanned_at: i64,
+}
+
+/// How a listed entry compares with the baseline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delta {
+    New,
+    Changed { before: u64, delta: i64 },
 }
 
 /// What a running apply is doing, updated by the apply thread.
@@ -158,6 +177,12 @@ pub struct App {
     message: Option<(String, Instant)>,
     details: HashMap<NodeId, Details>,
     pub home: Option<PathBuf>,
+    pub history: Option<History>,
+    /// An earlier scan to compare with (key `c`).
+    pub baseline: Option<Baseline>,
+    /// Size in the baseline of each listed entry: `None` if it is new, absent
+    /// if unknown (small files history does not record).
+    before: HashMap<NodeId, Option<u64>>,
     quit: bool,
 }
 
@@ -192,6 +217,9 @@ fn start_scan(root: PathBuf, target: PathBuf, select: Option<Vec<u8>>) -> Loadin
             && let Ok(store) = SnapshotStore::open_default()
         {
             let _ = store.save(tree);
+            if let Ok(history) = hogs_core::history::History::open_default() {
+                let _ = history.record(tree);
+            }
         }
         let _ = tx.send(result);
     });
@@ -218,6 +246,7 @@ impl App {
             )
         };
         let mut app = App::blank(StagingStore::open_default()?);
+        app.history = History::open_default().ok();
         let cached = SnapshotStore::open_default()
             .ok()
             .and_then(|s| s.load_covering(&target, MAX_AGE, staging::now()))
@@ -265,6 +294,9 @@ impl App {
             message: None,
             details: HashMap::new(),
             home: hogs_core::user::home(),
+            history: None,
+            baseline: None,
+            before: HashMap::new(),
             quit: false,
         };
         app.reload_staged();
@@ -363,7 +395,23 @@ impl App {
             .children(self.dir)
             .filter(|&id| needle.is_empty() || tree.name_lossy(id).to_lowercase().contains(&needle))
             .collect();
+        let before: HashMap<NodeId, Option<u64>> = match &self.baseline {
+            Some(b) if tree.path(self.dir).starts_with(b.tree.root_path()) => {
+                let old_dir = b.tree.lookup(&tree.path(self.dir));
+                diff::children(tree, Some(self.dir), &b.tree, old_dir)
+                    .into_iter()
+                    .filter_map(|c| Some((c.new?, c.old.map(|o| b.tree.alloc(o)))))
+                    .collect()
+            }
+            _ => HashMap::new(),
+        };
+        let growth = |id: NodeId| match before.get(&id) {
+            Some(Some(b)) => tree.alloc(id) as i64 - *b as i64,
+            Some(None) => tree.alloc(id) as i64,
+            None => 0,
+        };
         match self.sort {
+            Sort::Growth => entries.sort_by_key(|&id| std::cmp::Reverse(growth(id))),
             Sort::Size => {
                 entries.sort_by_key(|&id| std::cmp::Reverse((tree.alloc(id), tree.size(id))))
             }
@@ -372,7 +420,67 @@ impl App {
             Sort::Name => entries.sort_by_cached_key(|&id| tree.name_lossy(id).to_lowercase()),
         }
         self.entries = entries;
+        self.before = before;
         self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+    }
+
+    /// How `id` (an entry of the current directory) compares with the baseline;
+    /// `None` when not comparing or unknown.
+    pub fn delta(&self, id: NodeId) -> Option<Delta> {
+        let tree = self.tree.as_ref()?;
+        match self.before.get(&id)? {
+            Some(before) => Some(Delta::Changed {
+                before: *before,
+                delta: tree.alloc(id) as i64 - *before as i64,
+            }),
+            None => Some(Delta::New),
+        }
+    }
+
+    /// Compare with the newest earlier scan covering what is being browsed, or stop comparing.
+    fn toggle_compare(&mut self) {
+        if self.baseline.take().is_some() {
+            if self.sort == Sort::Growth {
+                self.sort = Sort::Size;
+            }
+            self.refresh_entries();
+            self.say("Comparison off.");
+            return;
+        }
+        let (Some(tree), Some(history)) = (&self.tree, &self.history) else {
+            self.say("No scan history available.");
+            return;
+        };
+        let cutoff = tree.scanned_at() - 1;
+        let pick = |path: &Path| {
+            history
+                .covering(path)
+                .into_iter()
+                .find(|e| e.scanned_at <= cutoff)
+        };
+        let Some(entry) = pick(tree.root_path()).or_else(|| pick(&tree.path(self.dir))) else {
+            self.say("No earlier scan of this folder in the history yet; check again after hogs has been used for a while.");
+            return;
+        };
+        match history.load(&entry) {
+            Ok(old) => {
+                let when = format!(
+                    "{} ({})",
+                    report::datetime(entry.scanned_at),
+                    report::ago(staging::now() - entry.scanned_at)
+                );
+                self.baseline = Some(Baseline {
+                    tree: old,
+                    scanned_at: entry.scanned_at,
+                });
+                self.sort = Sort::Growth;
+                self.refresh_entries();
+                self.say(format!(
+                    "Comparing with the scan from {when}. Press c again to stop."
+                ));
+            }
+            Err(e) => self.say(format!("Cannot read the earlier scan: {e}")),
+        }
     }
 
     pub fn selected_node(&self) -> Option<NodeId> {
@@ -509,8 +617,9 @@ impl App {
                 self.filter.clear();
                 self.refresh_entries();
             }
+            KeyCode::Char('c') => self.toggle_compare(),
             KeyCode::Char('o') => {
-                self.sort = self.sort.next();
+                self.sort = self.sort.next(self.baseline.is_some());
                 let current = self.selected_node();
                 self.refresh_entries();
                 if let Some(id) = current {
@@ -924,6 +1033,58 @@ mod tests {
             "other row: {:?}",
             bar_fg(3)
         );
+    }
+
+    #[test]
+    fn compare_with_an_earlier_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        fs::create_dir_all(root.join("logs")).unwrap();
+        fs::create_dir_all(root.join("static")).unwrap();
+        fs::write(root.join("logs/app.log"), vec![1u8; 2 << 20]).unwrap();
+        fs::write(root.join("static/video.bin"), vec![2u8; 3 << 20]).unwrap();
+        let hist = tempfile::tempdir().unwrap();
+        let history = History::at(hist.path().into());
+        let scan =
+            || hogs_scan::scan(&root, &ScanOptions::default(), &Progress::default()).unwrap();
+        history.record(&scan()).unwrap();
+        // Scans are told apart by their time in seconds.
+        std::thread::sleep(Duration::from_millis(1100));
+        fs::write(root.join("logs/app.log"), vec![1u8; 12 << 20]).unwrap();
+        fs::create_dir(root.join("new")).unwrap();
+        fs::write(root.join("new/data.bin"), vec![3u8; 4 << 20]).unwrap();
+
+        let data = tempfile::tempdir().unwrap();
+        let mut app = App::blank(StagingStore::at(data.path().join("staged.json")));
+        app.home = None;
+        app.history = Some(history);
+        app.set_tree(scan(), &root, None);
+        press(&mut app, KeyCode::Char('c'));
+        assert!(app.baseline.is_some(), "{:?}", app.message());
+        assert!(app.sort == Sort::Growth);
+        let names: Vec<String> = app
+            .entries
+            .iter()
+            .map(|&id| app.tree.as_ref().unwrap().name_lossy(id).into_owned())
+            .collect();
+        assert_eq!(names, ["logs", "new", "static"], "largest growth first");
+        let s = screen(&mut app);
+        println!("{s}");
+        assert!(s.contains("comparing with"), "{s}");
+        assert!(
+            s.lines()
+                .any(|l| l.contains("+10.0 MiB") && l.contains("logs/")),
+            "{s}"
+        );
+        assert!(
+            s.lines().any(|l| l.contains("new") && l.contains("new/")),
+            "{s}"
+        );
+        assert!(s.contains("before"), "{s}");
+
+        press(&mut app, KeyCode::Char('c'));
+        assert!(app.baseline.is_none() && app.sort == Sort::Size);
+        assert!(!screen(&mut app).contains("comparing with"));
     }
 
     #[test]

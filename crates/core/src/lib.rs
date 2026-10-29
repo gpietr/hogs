@@ -2,7 +2,9 @@
 //! scanners, the CLI and the TUI.
 
 pub mod build;
+pub mod diff;
 pub mod fmt;
+pub mod history;
 pub mod progress;
 pub mod protect;
 pub mod query;

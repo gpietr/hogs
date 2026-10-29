@@ -25,6 +25,7 @@ Workflow (for people and coding agents):
   1. hogs ls ~ -d 2             where the space goes, largest first
   2. hogs dirs PATH, hogs files PATH, hogs ext PATH, hogs find PATH --name ... --older 180d
                                drill down; look inside anything unfamiliar before judging it
+     hogs diff PATH [--since 1d]   what grew (or shrank) since an earlier scan; hogs keeps a history
   3. hogs stage PATH... --reason TEXT
                                stage items the user agreed to (paths can also come from stdin:
                                hogs find ~ --name node_modules --type d --older 180d --paths | hogs stage --reason ...)
@@ -139,6 +140,30 @@ enum Command {
         older: Option<i64>,
         #[arg(short = 'n', long, default_value_t = 50)]
         limit: usize,
+    },
+    /// Past scans: when, how big, and how they changed. With PATH, its size in each scan.
+    History {
+        path: Option<PathBuf>,
+        /// Delete the whole history.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// What changed since an earlier scan, largest change first: what is actively hogging space.
+    Diff {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Compare with the newest scan at least this old (e.g. 1d, 1w); default: the previous scan.
+        #[arg(long, value_parser = parse_duration)]
+        since: Option<i64>,
+        /// Levels to expand.
+        #[arg(short, long, default_value_t = 3)]
+        depth: usize,
+        /// Entries per level (or files with --files).
+        #[arg(short = 'n', long, default_value_t = 10)]
+        limit: usize,
+        /// List the files that changed most instead of a tree.
+        #[arg(long)]
+        files: bool,
     },
     /// Stage paths for deletion (reads paths from stdin if none are given). Deletes nothing.
     Stage {
@@ -270,6 +295,23 @@ fn run() -> Result<bool> {
             };
             commands::find(&mut ctx, &path, &filter, limit)?;
         }
+        Command::History { path, clear } => commands::history(&mut ctx, path.as_deref(), clear)?,
+        Command::Diff {
+            path,
+            since,
+            depth,
+            limit,
+            files,
+        } => commands::diff(
+            &mut ctx,
+            &path,
+            &commands::DiffOptions {
+                since,
+                depth,
+                limit,
+                files,
+            },
+        )?,
         Command::Stage { paths, reason, by } => {
             let paths = commands::input_paths(paths, cli.null)?;
             let by = by.unwrap_or_else(|| {

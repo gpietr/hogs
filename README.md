@@ -82,6 +82,7 @@ Run `hogs` (or `hogs tui PATH`) in a terminal.
 | `s` / `Space` | stage or unstage the selected item |
 | `Tab` | the staged list: who staged each item and why. `Space` leaves an item out, `u` unstages it |
 | `a` | apply: re-check the staged items and move them to the trash, after you confirm |
+| `c` | compare with an earlier scan: a change column and a "largest growth first" sort |
 | `/`, `o`, `r`, `?`, `q` | filter by name, change the sort (size, oldest change, files, name), rescan, help, quit |
 
 Items staged by an agent show up live, marked `✗`, with the agent's reason. Folders containing staged items get `•`.
@@ -117,11 +118,44 @@ change anywhere inside, and the path.
 | `hogs dirs [PATH]` / `hogs files [PATH]` | the largest folders or files below a path |
 | `hogs ext [PATH]` | space used per file extension |
 | `hogs find [PATH] --name GLOB --type f\|d --min-size 1G --older 180d` | search; matching folders are not searched further |
+| `hogs diff [PATH] [--since 1d] [--files]` | what grew or shrank since an earlier scan, largest change first |
+| `hogs history [PATH]` | past scans and how sizes changed; `--clear` deletes the history |
 | `hogs stage PATH... --reason TEXT` | stage paths for deletion (paths can also come from stdin). Deletes nothing |
 | `hogs staged [list\|apply\|remove\|clear]` | review the staged list, or apply it: to the trash, or `--permanent` |
 | `hogs scan [PATH]` | rescan and print a summary; `--backend auto\|generic\|mft` picks the scanner |
 
 Global options: `--paths` / `-0` (print only paths), `--rescan`, `--max-age 10m`.
+
+### Seeing what grows
+
+hogs keeps a history of its scans, so you can see what is *actively* filling the disk:
+
+```
+$ hogs diff ~/projects
+~/projects: 709.2 MiB now, +272.0 MiB since 2026-10-29 16:41 UTC (2h ago)
+ +200.0 MiB  390.0 MiB  ~/projects/ml-notebook/
+   +200.0 MiB  340.0 MiB  ~/projects/ml-notebook/data/
+     +200.0 MiB  200.0 MiB  ~/projects/ml-notebook/data/raw/  [new]
+  +52.0 MiB  111.0 MiB  ~/projects/website/
+    +90.0 MiB  111.0 MiB  ~/projects/website/node_modules/
+      +90.0 MiB  111.0 MiB  ~/projects/website/node_modules/next/
+    -38.0 MiB    8.0 KiB  ~/projects/website/public/
+      -38.0 MiB    4.0 KiB  ~/projects/website/public/videos/
+
+$ hogs diff ~/projects --files -n 3
+~/projects: 709.2 MiB now, +272.0 MiB since 2026-10-29 16:41 UTC (2h ago)
+ +200.0 MiB  200.0 MiB  ~/projects/ml-notebook/data/raw/dump-2026-10.csv  [new]
+  +90.0 MiB   90.0 MiB  ~/projects/website/node_modules/next/dist/compiled.js  [new]
+  -38.0 MiB        0 B  ~/projects/website/public/videos/intro.mp4  [gone]
+```
+
+- **What is compared.** `hogs diff` compares with the previous scan by default. Use `--since 1d` or
+  `--since 1w` to compare with the newest scan at least that old.
+- **What gets saved.** Every scan is added to the history, at most one per 10 minutes. The history is
+  thinned out over time: the last 3 scans, one per day for a month, and one per week for half a year.
+- **How much space it takes.** History entries keep every folder with its exact size, but only files of
+  1 MiB or more, so a scan of a 500k-file home folder takes about 0.7 MB. Smaller files are never listed
+  individually, but their changes still show in their folders' totals.
 
 ## Working with coding agents
 
@@ -159,6 +193,7 @@ labelled `claude-code`.
 |---|---|---|---|
 | Staged list | `~/.local/share/hogs/` | `%LOCALAPPDATA%\hogs\` | `~/Library/Application Support/hogs/` |
 | Saved scans | `~/.cache/hogs/` | `%LOCALAPPDATA%\hogs\cache\` | `~/Library/Caches/hogs/` |
+| Scan history | `~/.cache/hogs/history/` | `%LOCALAPPDATA%\hogs\cache\history\` | `~/Library/Caches/hogs/history/` |
 
 Set `HOGS_DATA_DIR` and `HOGS_CACHE_DIR` to override these locations.
 

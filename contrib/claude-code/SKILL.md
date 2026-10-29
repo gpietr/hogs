@@ -14,6 +14,9 @@ inside, and the path. Judging what something is and whether it is worth deleting
 1. Start with `hogs ls ~ -d 2`, or the directory the user cares about.
 2. Drill down with `hogs ls PATH -d 2`, `hogs dirs PATH`, `hogs files PATH`, `hogs ext PATH`, or
    `hogs find PATH --name 'PATTERN' --type d|f --min-size 1G --older 180d`.
+   To find what is *actively* filling the disk, use `hogs diff PATH`, which compares with the
+   previous scan, or `hogs diff PATH --since 1d`. Add `--files` to list the files that grew.
+   `hogs history PATH` shows how a folder's size changed over time.
 3. Before judging anything unfamiliar, look at it: what is next to it (a `package.json` or
    `Cargo.toml` means a project) and what is inside. Remember that `node_modules` or `target`
    inside an installed application is part of that application, not a rebuildable artifact.

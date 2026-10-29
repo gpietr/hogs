@@ -132,6 +132,16 @@ pub fn read(data: &[u8]) -> io::Result<Tree> {
     Ok(tree)
 }
 
+/// FNV-1a of a path: stable across Rust versions, unlike `DefaultHasher`.
+pub(crate) fn path_hash(path: &Path) -> u64 {
+    path.as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        })
+}
+
 /// A directory of snapshots, one per scanned root.
 pub struct SnapshotStore {
     dir: PathBuf,
@@ -151,15 +161,7 @@ impl SnapshotStore {
     }
 
     fn file_for(&self, root: &Path) -> PathBuf {
-        // FNV-1a: stable across Rust versions, unlike DefaultHasher.
-        let hash = root
-            .as_os_str()
-            .as_encoded_bytes()
-            .iter()
-            .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
-                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-            });
-        self.dir.join(format!("{hash:016x}.snap"))
+        self.dir.join(format!("{:016x}.snap", path_hash(root)))
     }
 
     /// Saves a tree, dropping snapshots of directories inside it (now redundant).

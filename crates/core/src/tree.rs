@@ -157,6 +157,51 @@ impl Tree {
             .filter(|&id| self.flags(id) & flags::OTHER_FS == 0)
     }
 
+    /// A copy with only the nodes `keep` accepts (and always the root). Kept
+    /// nodes keep their original totals, so directory sizes stay exact even
+    /// when their small files are left out. Children of a dropped node are
+    /// dropped too.
+    pub fn pruned(&self, keep: impl Fn(NodeId) -> bool) -> Tree {
+        let mut order: Vec<NodeId> = vec![Self::ROOT];
+        let mut parent = vec![NO_PARENT];
+        let mut first_child = Vec::new();
+        let mut child_count = Vec::new();
+        let mut head = 0;
+        while head < order.len() {
+            let old = order[head];
+            let start = order.len();
+            order.extend(self.children(old).filter(|&c| keep(c)));
+            first_child.push(start as NodeId);
+            child_count.push((order.len() - start) as u32);
+            parent.resize(order.len(), head as NodeId);
+            head += 1;
+        }
+        let mut names = Vec::new();
+        let mut name_off = Vec::with_capacity(order.len());
+        let mut name_len = Vec::with_capacity(order.len());
+        for &id in &order {
+            name_off.push(names.len() as u32);
+            name_len.push(self.name_len[id as usize]);
+            names.extend_from_slice(self.name(id));
+        }
+        let pick = |v: &Vec<u64>| order.iter().map(|&i| v[i as usize]).collect();
+        Tree {
+            root: self.root.clone(),
+            scanned_at: self.scanned_at,
+            names,
+            name_off,
+            name_len,
+            parent,
+            first_child,
+            child_count,
+            size: pick(&self.size),
+            alloc: pick(&self.alloc),
+            mtime: order.iter().map(|&i| self.mtime[i as usize]).collect(),
+            files: order.iter().map(|&i| self.files[i as usize]).collect(),
+            flags: order.iter().map(|&i| self.flags[i as usize]).collect(),
+        }
+    }
+
     /// Finds the node for an absolute path inside the scanned root.
     pub fn lookup(&self, path: &Path) -> Option<NodeId> {
         let rel = path.strip_prefix(&self.root).ok()?;
