@@ -19,9 +19,12 @@ const SYSTEM: &[&str] = &[
     "/sys",
     "/usr",
     "/var/lib",
-    // macOS, where /etc and /var resolve into /private.
+    // macOS, where /etc and /var resolve into /private. Not all of /private/var:
+    // per-user temp and cache folders live in /private/var/folders.
     "/private/etc",
-    "/private/var",
+    "/private/var/db",
+    "/private/var/root",
+    "/private/var/vm",
     "/System",
     "/Library",
     "*:/windows",
@@ -126,6 +129,9 @@ mod tests {
         assert!(protected("/var"));
         assert!(protected("/private"));
         assert!(protected("/private/etc/hosts"));
+        assert!(protected("/private/var/db/receipts"));
+        assert!(protected("/private/var"));
+        assert!(!protected("/private/var/folders/ab/xyz/T/old-build"));
         assert!(protected("/home/u/x/../../../usr"));
         assert!(protected("/usr/./lib"));
         assert!(!protected("/home/u/./x"));

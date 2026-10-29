@@ -18,6 +18,8 @@ pub struct Session {
     rescan: bool,
     opts: ScanOptions,
     trees: Vec<Rc<Tree>>,
+    /// Backend of the most recent scan, for reporting.
+    pub last_backend: &'static str,
 }
 
 impl Session {
@@ -40,15 +42,20 @@ impl Session {
             rescan,
             opts,
             trees: Vec::new(),
+            last_backend: "",
         }
     }
 
     /// Scans `dir` and saves the result to the snapshot cache.
     pub fn scan(&mut self, dir: &Path) -> Result<(Rc<Tree>, f64)> {
         let start = Instant::now();
-        let tree = hogs_scan::scan(dir, &self.opts, &Progress::default())
+        let (tree, report) = hogs_scan::scan_report(dir, &self.opts, &Progress::default())
             .with_context(|| format!("cannot scan {}", dir.display()))?;
         let secs = start.elapsed().as_secs_f64();
+        if let Some(why) = &report.fallback {
+            eprintln!("hogs: {why}; using the slower directory walk");
+        }
+        self.last_backend = report.backend;
         if let Some(store) = &self.store
             && let Err(e) = store.save(&tree)
         {
@@ -97,7 +104,8 @@ impl Session {
         } else {
             path.parent().unwrap_or(&path)
         };
-        let (tree, secs) = self.scan(dir)?;
+        // With the NTFS fast path this is the whole drive, saved for later commands.
+        let (tree, secs) = self.scan(&hogs_scan::preferred_root(dir))?;
         eprintln!(
             "hogs: scanned {} ({} files) in {secs:.2}s",
             tree.root_path().display(),

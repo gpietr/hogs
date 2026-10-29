@@ -185,7 +185,13 @@ impl App {
             .filter(|t| t.lookup_scanned(&target).is_some());
         match cached {
             Some(tree) => app.set_tree(tree, &target, select),
-            None => app.loading = Some(start_scan(target.clone(), target, select)),
+            None => {
+                app.loading = Some(start_scan(
+                    hogs_scan::preferred_root(&target),
+                    target,
+                    select,
+                ))
+            }
         }
         Ok(app)
     }

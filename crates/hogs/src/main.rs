@@ -177,6 +177,8 @@ enum StagedAction {
 enum BackendArg {
     Auto,
     Generic,
+    /// NTFS master file table (Windows, Administrator).
+    Mft,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -237,11 +239,12 @@ fn run() -> Result<bool> {
                 backend: match backend {
                     BackendArg::Auto => Backend::Auto,
                     BackendArg::Generic => Backend::Generic,
+                    BackendArg::Mft => Backend::Mft,
                 },
             };
             let mut session = Session::new(cli.max_age, true, opts);
             let (tree, secs) = session.scan(&session::canonical(&path)?)?;
-            print_summary(&tree, secs, top, bytes)?;
+            print_summary(&tree, secs, top, bytes, session.last_backend)?;
         }
         Command::Ls { path, depth, limit } => commands::ls(&mut ctx, &path, depth, limit)?,
         Command::Files { path, limit } => commands::files(&mut ctx, &path, limit)?,
@@ -318,7 +321,7 @@ fn run() -> Result<bool> {
     Ok(true)
 }
 
-fn print_summary(tree: &Tree, secs: f64, top: usize, bytes: bool) -> Result<()> {
+fn print_summary(tree: &Tree, secs: f64, top: usize, bytes: bool, backend: &str) -> Result<()> {
     let fmt = |n: u64| if bytes { n.to_string() } else { human_size(n) };
     let root = Tree::ROOT;
     let (mut dirs, mut errors) = (0, 0);
@@ -327,7 +330,7 @@ fn print_summary(tree: &Tree, secs: f64, top: usize, bytes: bool) -> Result<()> 
         errors += u64::from(tree.is_dir(id) && tree.flags(id) & flags::ERROR != 0);
     }
     let mut out = format!(
-        "{}  {} on disk ({} apparent), {} files, {dirs} dirs, {errors} unreadable dirs, {secs:.2}s\n",
+        "{}  {} on disk ({} apparent), {} files, {dirs} dirs, {errors} unreadable dirs, {secs:.2}s ({backend})\n",
         tree.root_path().display(),
         fmt(tree.alloc(root)),
         fmt(tree.size(root)),

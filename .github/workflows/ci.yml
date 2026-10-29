@@ -15,7 +15,7 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -27,3 +27,8 @@ jobs:
       - run: cargo run --release -- scan . -n 5
       - run: cargo run --release -- ls ~ -n 5
         shell: bash
+      # Windows: time a whole-drive scan with the MFT reader and with the directory walk.
+      - if: runner.os == 'Windows'
+        run: cargo run --release -- scan C:\ --backend mft -n 10
+      - if: runner.os == 'Windows'
+        run: cargo run --release -- scan C:\ --backend generic -n 10

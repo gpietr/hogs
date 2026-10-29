@@ -15,6 +15,10 @@ use hogs_core::{Progress, Tree};
 mod generic;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(any(windows, test))]
+mod ntfs;
+#[cfg(windows)]
+mod windows_mft;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Backend {
@@ -23,6 +27,15 @@ pub enum Backend {
     Auto,
     /// Portable `std::fs` walker.
     Generic,
+    /// Read the NTFS master file table directly (Windows, Administrator only).
+    Mft,
+}
+
+/// Which backend produced a tree, and why a faster one was not used.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanReport {
+    pub backend: &'static str,
+    pub fallback: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +59,26 @@ impl Default for ScanOptions {
 
 /// Scans `root` (a directory) and returns its full tree.
 pub fn scan(root: &Path, opts: &ScanOptions, progress: &Progress) -> io::Result<Tree> {
+    scan_report(root, opts, progress).map(|(tree, _)| tree)
+}
+
+/// Where to scan to answer questions about `dir`. With the NTFS fast path that
+/// is the whole drive: reading the MFT costs the same for any folder on it, so
+/// one saved scan of the drive then answers every later command (like WizTree).
+pub fn preferred_root(dir: &Path) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(root) = windows_mft::drive_root_if_fast(dir) {
+        return root;
+    }
+    dir.to_path_buf()
+}
+
+/// Like [`scan`], also reporting which backend was used.
+pub fn scan_report(
+    root: &Path,
+    opts: &ScanOptions,
+    progress: &Progress,
+) -> io::Result<(Tree, ScanReport)> {
     // dunce: plain `C:\...` paths on Windows rather than `\\?\C:\...` where possible.
     let root = dunce::canonicalize(root)?;
     if !root.is_dir() {
@@ -65,13 +98,49 @@ pub fn scan(root: &Path, opts: &ScanOptions, progress: &Progress) -> io::Result<
         .thread_name(|i| format!("hogs-scan-{i}"))
         .build()
         .map_err(io::Error::other)?;
+    let report = |backend, fallback| ScanReport { backend, fallback };
     pool.install(|| match opts.backend {
-        #[cfg(target_os = "linux")]
-        Backend::Auto => linux::scan(root, opts, progress),
-        #[cfg(not(target_os = "linux"))]
-        Backend::Auto => generic::scan(root, opts, progress),
-        Backend::Generic => generic::scan(root, opts, progress),
+        Backend::Generic => Ok((
+            generic::scan(root, opts, progress)?,
+            report("directory walk", None),
+        )),
+        Backend::Mft => Ok((mft(&root, progress)?, report("NTFS MFT", None))),
+        Backend::Auto => {
+            #[cfg(windows)]
+            let fallback = match mft(&root, progress) {
+                Ok(tree) => return Ok((tree, report("NTFS MFT", None))),
+                Err(e) => {
+                    progress.reset();
+                    Some(match e.kind() {
+                        io::ErrorKind::PermissionDenied => {
+                            "the fast NTFS scan needs Administrator rights".to_string()
+                        }
+                        _ => format!("the fast NTFS scan is unavailable: {e}"),
+                    })
+                }
+            };
+            #[cfg(not(windows))]
+            let fallback = None;
+            #[cfg(target_os = "linux")]
+            let tree = linux::scan(root, opts, progress)?;
+            #[cfg(not(target_os = "linux"))]
+            let tree = generic::scan(root, opts, progress)?;
+            Ok((tree, report("directory walk", fallback)))
+        }
     })
+}
+
+#[cfg(windows)]
+fn mft(root: &Path, progress: &Progress) -> io::Result<Tree> {
+    windows_mft::scan(root, progress)
+}
+
+#[cfg(not(windows))]
+fn mft(_root: &Path, _progress: &Progress) -> io::Result<Tree> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the NTFS MFT backend only exists on Windows",
+    ))
 }
 
 /// State shared by the tasks of one scan. Finished batches stream to a

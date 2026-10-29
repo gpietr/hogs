@@ -664,6 +664,7 @@ dependencies = [
  "rayon",
  "rustix",
  "tempfile",
+ "windows-sys",
 ]
 
 [[package]]

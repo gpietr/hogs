@@ -25,6 +25,13 @@ impl Progress {
         self.errors.fetch_add(errors, Ordering::Relaxed);
     }
 
+    /// Back to zero, e.g. when a scan restarts with another backend.
+    pub fn reset(&self) {
+        for counter in [&self.files, &self.dirs, &self.bytes, &self.errors] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+
     pub fn snapshot(&self) -> ProgressSnapshot {
         ProgressSnapshot {
             files: self.files.load(Ordering::Relaxed),
