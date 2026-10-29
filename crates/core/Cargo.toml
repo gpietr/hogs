@@ -1,0 +1,16 @@
+[package]
+name = "hogs-core"
+description = "Tree model and queries shared by the hogs scanners, CLI and TUI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.191"

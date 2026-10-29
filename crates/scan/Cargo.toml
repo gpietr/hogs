@@ -1,0 +1,17 @@
+[package]
+name = "hogs-scan"
+description = "Fast parallel filesystem scanners for hogs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dunce.workspace = true
+hogs-core.workspace = true
+rayon.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

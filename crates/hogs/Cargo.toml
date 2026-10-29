@@ -1,0 +1,22 @@
+[package]
+name = "hogs"
+description = "Blazing fast disk usage analyzer that works with coding agents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "hogs"
+path = "src/main.rs"
+
+[dependencies]
+dunce.workspace = true
+hogs-core.workspace = true
+hogs-scan.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+trash = "5.2"
+ratatui = "0.30"
+
+[dev-dependencies]
+tempfile.workspace = true
