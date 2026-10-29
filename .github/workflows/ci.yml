@@ -6,6 +6,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Runners are Administrators on NTFS: the MFT test must run, not skip.
+  HOGS_REQUIRE_MFT: 1
 
 jobs:
   test:

@@ -58,9 +58,9 @@ pub fn is_protected(path: &Path, homes: &[PathBuf]) -> Option<String> {
     }
     if let Some(dir) = path
         .ancestors()
-        .find_map(|p| SYSTEM.iter().find(|s| matches(s, p)))
+        .find(|p| SYSTEM.iter().any(|s| matches(s, p)))
     {
-        return Some(format!("is inside the system directory {dir}"));
+        return Some(format!("is inside the system directory {}", dir.display()));
     }
     // Deleting a parent of a system directory deletes that too. (Drive-wildcard
     // entries only have drive roots as parents, which are refused above.)

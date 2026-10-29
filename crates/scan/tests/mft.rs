@@ -33,8 +33,17 @@ fn mft_matches_directory_walk() {
     };
     let mft = match scan(dir, &opts(Backend::Mft), &Progress::default()) {
         Ok(t) => t,
-        Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-            eprintln!("skipping: the MFT backend needs Administrator rights ({e})");
+        // Without Administrator rights, on non-NTFS volumes and under Wine the
+        // backend is unavailable. CI sets HOGS_REQUIRE_MFT so it never silently skips.
+        Err(e) if std::env::var_os("HOGS_REQUIRE_MFT").is_none() => {
+            let why = if e.kind() == ErrorKind::PermissionDenied {
+                "needs Administrator rights"
+            } else {
+                "is unavailable"
+            };
+            eprintln!(
+                "skipping: the MFT backend {why} here ({e}); set HOGS_REQUIRE_MFT=1 to fail instead"
+            );
             return;
         }
         Err(e) => panic!("MFT scan failed: {e}"),
