@@ -63,12 +63,18 @@ fn mft_matches_directory_walk() {
         .filter(|(_, (_, f))| f & skip == 0)
         .filter_map(|(p, &(size, _))| {
             let (msize, mflags) = m[p];
-            (mflags & flags::HARDLINK_DUP == 0 && msize != size).then_some((p, size, msize))
+            if mflags & flags::HARDLINK_DUP != 0 || msize == size {
+                return None;
+            }
+            // Directory listings cache sizes, and lag for files open for writing
+            // (live logs); opening the file gives the real size to compare with.
+            let real = std::fs::metadata(dir.join(p)).map(|m| m.len()).ok();
+            (real != Some(msize)).then_some((p, size, msize, real))
         })
         .collect();
     assert!(
         mismatched.is_empty(),
-        "{} size mismatches (path, walk, MFT), e.g. {:?}",
+        "{} size mismatches (path, walk, MFT, real), e.g. {:?}",
         mismatched.len(),
         &mismatched[..mismatched.len().min(10)]
     );

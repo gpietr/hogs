@@ -103,12 +103,16 @@ fn non_utf8_names_round_trip() {
     use std::os::unix::ffi::OsStrExt;
     let dir = tempfile::tempdir().unwrap();
     let name = OsStr::from_bytes(b"bad\xffname");
-    fs::write(dir.path().join(name), b"data").unwrap();
+    // Some filesystems (APFS) refuse names that are not valid UTF-8.
+    let bad_allowed = fs::write(dir.path().join(name), b"data").is_ok();
     fs::write(dir.path().join("zażółć"), b"data").unwrap();
     for backend in backends() {
         let t = scan_with(dir.path(), backend);
         let id = node(&t, "zażółć");
         assert_eq!(t.size(id), 4);
+        if !bad_allowed {
+            continue;
+        }
         let bad = t
             .lookup(&dir.path().canonicalize().unwrap().join(name))
             .unwrap();
