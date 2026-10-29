@@ -23,9 +23,6 @@ const ATTR_INDEX_ALLOCATION: u32 = 0xA0;
 const ATTR_REPARSE_POINT: u32 = 0xC0;
 const ATTR_END: u32 = 0xFFFF_FFFF;
 
-const ATTR_FLAG_COMPRESSED: u16 = 0x0001;
-const ATTR_FLAG_SPARSE: u16 = 0x8000;
-
 const NAMESPACE_DOS: u8 = 2;
 const REPARSE_TAG_MOUNT_POINT: u32 = 0xA000_0003;
 const REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
@@ -153,7 +150,7 @@ pub struct Record {
 
 /// Parses a FILE record whose fixups were applied. `None` for records that are
 /// not in use or malformed.
-pub fn parse_record(rec: &[u8]) -> Option<Record> {
+pub fn parse_record(rec: &[u8], cluster_size: u64) -> Option<Record> {
     let flags = u16_at(rec, 22)?;
     if flags & 0x01 == 0 {
         return None;
@@ -165,7 +162,9 @@ pub fn parse_record(rec: &[u8]) -> Option<Record> {
         is_dir: flags & 0x02 != 0,
         ..Default::default()
     };
-    for_each_attribute(rec, |kind, attr| parse_attribute(kind, attr, &mut out))?;
+    for_each_attribute(rec, |kind, attr| {
+        parse_attribute(kind, attr, cluster_size, &mut out)
+    })?;
     Some(out)
 }
 
@@ -209,32 +208,32 @@ pub fn mft_data_runs(rec: &[u8]) -> Option<Vec<Run>> {
     runs
 }
 
-fn parse_attribute(kind: u32, attr: &[u8], out: &mut Record) -> Option<()> {
+fn parse_attribute(kind: u32, attr: &[u8], cluster_size: u64, out: &mut Record) -> Option<()> {
     let non_resident = attr[8] != 0;
     let name_len = attr[9];
-    let attr_flags = u16_at(attr, 12)?;
     if non_resident {
-        // Sizes are only valid in the first segment of a multi-segment attribute.
-        if u64_at(attr, 16)? != 0 {
+        if !matches!(kind, ATTR_DATA | ATTR_INDEX_ALLOCATION) {
             return Some(());
         }
-        let allocated = u64_at(attr, 40)?;
-        let data_size = u64_at(attr, 48)?;
-        let on_disk = if attr_flags & (ATTR_FLAG_COMPRESSED | ATTR_FLAG_SPARSE) != 0 {
-            u64_at(attr, 64).unwrap_or(allocated)
-        } else {
-            allocated
-        };
-        match kind {
-            ATTR_DATA => {
-                out.alloc += on_disk;
-                if name_len == 0 {
-                    out.size = Some(data_size);
-                }
-            }
-            ATTR_INDEX_ALLOCATION => out.alloc += on_disk,
-            _ => {}
+        // Sizes are only valid in the first segment of a multi-segment attribute.
+        let first_segment = u64_at(attr, 16)? == 0;
+        if kind == ATTR_DATA && name_len == 0 && first_segment {
+            out.size = Some(u64_at(attr, 48)?);
         }
+        // On-disk size from the clusters that really exist. The allocated-size
+        // field includes sparse ranges ($BadClus:$Bad spans the whole volume and
+        // is not even flagged sparse), and each segment lists its own runs.
+        let pairs = u16_at(attr, 32)? as usize;
+        out.alloc += match attr.get(pairs..).and_then(parse_runs) {
+            Some(runs) => runs
+                .iter()
+                .filter(|r| r.lcn.is_some())
+                .map(|r| r.clusters)
+                .sum::<u64>()
+                .saturating_mul(cluster_size),
+            None if first_segment => u64_at(attr, 40)?,
+            None => 0,
+        };
         return Some(());
     }
     let value_len = u32_at(attr, 16)? as usize;
@@ -513,24 +512,22 @@ pub(crate) mod tests {
         a
     }
 
-    fn non_resident(
-        kind: u32,
-        name_len: u8,
-        flags: u16,
-        alloc: u64,
-        size: u64,
-        compressed: u64,
-    ) -> Vec<u8> {
-        let mut a = vec![0u8; 80];
+    const CLUSTER: u64 = 4096;
+
+    /// A non-resident attribute with the given mapping pairs (data runs).
+    fn non_resident(kind: u32, name_len: u8, lowest_vcn: u64, runs: &[u8], size: u64) -> Vec<u8> {
+        let len = (72 + runs.len() + 1).div_ceil(8) * 8;
+        let mut a = vec![0u8; len];
         a[0..4].copy_from_slice(&kind.to_le_bytes());
-        a[4..8].copy_from_slice(&80u32.to_le_bytes());
+        a[4..8].copy_from_slice(&(len as u32).to_le_bytes());
         a[8] = 1;
         a[9] = name_len;
-        a[12..14].copy_from_slice(&flags.to_le_bytes());
-        a[32..34].copy_from_slice(&72u16.to_le_bytes()); // mapping pairs (empty)
-        a[40..48].copy_from_slice(&alloc.to_le_bytes());
+        a[16..24].copy_from_slice(&lowest_vcn.to_le_bytes());
+        a[32..34].copy_from_slice(&72u16.to_le_bytes());
+        // The allocated-size field is deliberately bogus: on-disk size must come from the runs.
+        a[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
         a[48..56].copy_from_slice(&size.to_le_bytes());
-        a[64..72].copy_from_slice(&compressed.to_le_bytes());
+        a[72..72 + runs.len()].copy_from_slice(runs);
         a
     }
 
@@ -555,7 +552,7 @@ pub(crate) mod tests {
 
     fn parse(mut r: Vec<u8>) -> Record {
         assert!(apply_fixups(&mut r));
-        parse_record(&r).expect("valid record")
+        parse_record(&r, CLUSTER).expect("valid record")
     }
 
     #[test]
@@ -587,8 +584,7 @@ pub(crate) mod tests {
 
     #[test]
     fn finds_the_mft_runs() {
-        let mut data = non_resident(ATTR_DATA, 0, 0, 1 << 20, 1 << 20, 0);
-        data[72..76].copy_from_slice(&[0x11, 0x40, 0x10, 0x00]); // 0x40 clusters at LCN 0x10
+        let data = non_resident(ATTR_DATA, 0, 0, &[0x11, 0x40, 0x10], 1 << 20); // 0x40 clusters at LCN 0x10
         let mut r = record(1, false, 0, &[file_name(5, 5, "$MFT", 3), data]);
         assert!(apply_fixups(&mut r));
         assert_eq!(
@@ -620,9 +616,9 @@ pub(crate) mod tests {
                 std_info(1_700_000_000),
                 file_name(5, 5, "PROGRA~1", NAMESPACE_DOS),
                 file_name(5, 5, "Program file.txt", 1),
-                non_resident(ATTR_DATA, 0, 0, 8192, 5000, 0),
+                non_resident(ATTR_DATA, 0, 0, &[0x11, 0x02, 0x10], 5000),
                 // An alternate data stream adds to the allocation but not the size.
-                non_resident(ATTR_DATA, 4, 0, 4096, 100, 0),
+                non_resident(ATTR_DATA, 4, 0, &[0x11, 0x01, 0x20], 100),
             ],
         ));
         assert_eq!(r.sequence, 7);
@@ -631,6 +627,7 @@ pub(crate) mod tests {
         assert_eq!(r.names[0].name, b"Program file.txt");
         assert_eq!((r.size, r.alloc), (Some(5000), 8192 + 4096));
 
+        // Compressed: 3 real clusters, the rest of the compression unit sparse.
         let compressed = parse(record(
             1,
             false,
@@ -638,13 +635,41 @@ pub(crate) mod tests {
             &[non_resident(
                 ATTR_DATA,
                 0,
-                ATTR_FLAG_COMPRESSED,
-                65536,
+                0,
+                &[0x11, 0x03, 0x20, 0x01, 0x0D],
                 60000,
-                12288,
             )],
         ));
         assert_eq!((compressed.size, compressed.alloc), (Some(60000), 12288));
+        // $BadClus:$Bad: a named stream as large as the volume, all sparse.
+        let bad = parse(record(
+            1,
+            false,
+            0,
+            &[non_resident(
+                ATTR_DATA,
+                4,
+                0,
+                &[0x04, 0x00, 0x00, 0x00, 0x08],
+                0,
+            )],
+        ));
+        assert_eq!((bad.size, bad.alloc), (None, 0));
+        // A data stream split across two segments: both count, the size comes from the first.
+        let first = parse(record(
+            1,
+            false,
+            0,
+            &[non_resident(ATTR_DATA, 0, 0, &[0x11, 0x02, 0x10], 30000)],
+        ));
+        let rest = parse(record(
+            1,
+            false,
+            40,
+            &[non_resident(ATTR_DATA, 0, 2, &[0x11, 0x05, 0x40], 999)],
+        ));
+        assert_eq!((first.size, first.alloc), (Some(30000), 2 * CLUSTER));
+        assert_eq!((rest.size, rest.alloc), (None, 5 * CLUSTER));
         let small = parse(record(1, false, 0, &[resident(ATTR_DATA, 0, b"hello")]));
         assert_eq!((small.size, small.alloc), (Some(5), 0));
         let mut junction = vec![0u8; 8];
@@ -691,7 +716,7 @@ pub(crate) mod tests {
                 &[
                     std_info(30),
                     file_name(30, 1, "me", 1),
-                    non_resident(ATTR_INDEX_ALLOCATION, 4, 0, 4096, 4096, 0),
+                    non_resident(ATTR_INDEX_ALLOCATION, 4, 0, &[0x11, 0x01, 0x30], 4096),
                 ],
             ),
         );
@@ -704,7 +729,7 @@ pub(crate) mod tests {
                 &[
                     std_info(40),
                     file_name(31, 1, "big.bin", 1),
-                    non_resident(ATTR_DATA, 0, 0, 1 << 20, 1_000_000, 0),
+                    non_resident(ATTR_DATA, 0, 0, &[0x22, 0x00, 0x01, 0x40, 0x00], 1_000_000),
                 ],
             ),
         );

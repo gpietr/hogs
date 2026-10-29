@@ -175,7 +175,10 @@ pub(crate) fn scan(root: &Path, progress: &Progress) -> io::Result<Tree> {
                     if !ntfs::apply_fixups(rec) {
                         return None;
                     }
-                    Some(((first + i) as u32, ntfs::parse_record(rec)?))
+                    Some((
+                        (first + i) as u32,
+                        ntfs::parse_record(rec, vol.bytes_per_cluster)?,
+                    ))
                 })
                 .collect();
             let (mut files, mut bytes) = (0, 0);
