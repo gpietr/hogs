@@ -3,7 +3,9 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-alpha.1"
+license = "MIT"
+repository = "https://github.com/gpietr/hogs"
 edition = "2024"
 rust-version = "1.89"
 

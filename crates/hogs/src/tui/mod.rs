@@ -877,6 +877,54 @@ mod tests {
         );
     }
 
+    /// Prints the browser on a folder, for README screenshots. The largest
+    /// `node_modules` inside is shown as staged by an agent.
+    /// `HOGS_SCREENSHOT=<dir> cargo test -p hogs readme_screenshot -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn readme_screenshot() {
+        let Some(dir) = std::env::var_os("HOGS_SCREENSHOT") else {
+            return;
+        };
+        let root = dunce::canonicalize(dir).unwrap();
+        let tree = hogs_scan::scan(&root, &ScanOptions::default(), &Progress::default()).unwrap();
+        let filter = hogs_core::query::Filter {
+            name: Some("node_modules".into()),
+            ..Default::default()
+        };
+        let modules = hogs_core::query::find(&tree, Tree::ROOT, &filter, 1).matches[0];
+        let data = tempfile::tempdir().unwrap();
+        let store = StagingStore::at(data.path().join("staged.json"));
+        let item = StagedItem {
+            path: tree.path(modules),
+            alloc: tree.alloc(modules),
+            newest_mtime: tree.mtime(modules),
+            reason: "JS dependencies of an app untouched for 2 years; npm install restores them"
+                .into(),
+            staged_by: "claude-code".into(),
+            staged_at: staging::now(),
+        };
+        store.update(|items| staging::stage(items, item)).unwrap();
+        let mut app = App::blank(store);
+        app.home = root.parent().map(Path::to_path_buf);
+        app.set_tree(tree, &root, None);
+        let parent = app.tree.as_ref().unwrap().parent(modules).unwrap();
+        app.enter_dir(parent);
+        app.select_where(|_, id| id == modules);
+        let mut terminal = Terminal::new(TestBackend::new(124, 20)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        for y in 0..buf.area.height {
+            println!(
+                "{}",
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn protected_paths_cannot_be_staged() {
