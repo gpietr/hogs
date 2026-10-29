@@ -124,7 +124,8 @@ mod tests {
         let uid = unsafe { libc::getuid() };
         let (home, _) = passwd_entry(uid).expect("current user is in the user database");
         assert!(home.is_absolute());
-        assert!(passwd_entry(u32::MAX - 1).is_none());
+        // Not u32::MAX - 1 or - 2: those are `nobody`/`nogroup` on macOS.
+        assert!(passwd_entry(3_000_000_000).is_none());
     }
 
     #[test]

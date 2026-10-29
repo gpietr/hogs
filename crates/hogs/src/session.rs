@@ -182,10 +182,11 @@ mod tests {
             .unwrap();
 
         let (tree, id) = session(cache.path()).resolve(&root.join("mnt")).unwrap();
-        assert_eq!(
-            tree.root_path(),
-            root.join("mnt"),
-            "should scan the mount instead of reusing the empty node"
+        // A fresh scan: of mnt/ itself, or of the whole drive with the NTFS fast path.
+        assert_eq!(tree.path(id), root.join("mnt"));
+        assert!(
+            tree.root_path() != root,
+            "should not reuse the empty node from the saved scan"
         );
         assert_eq!(tree.files(id), 1);
     }
